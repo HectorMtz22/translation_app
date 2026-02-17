@@ -3,8 +3,8 @@
 Live System Audio Transcription with Speaker Diarization
 
 Captures system audio via BlackHole virtual audio device,
-transcribes using faster-whisper, and separates speakers
-using resemblyzer voice embeddings.
+transcribes using mlx-whisper (GPU-accelerated on Apple Silicon),
+and separates speakers using resemblyzer voice embeddings.
 
 Setup:
   1. Install BlackHole 2ch: brew install --cask blackhole-2ch
@@ -24,7 +24,7 @@ from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
+import mlx_whisper
 
 # Try to import resemblyzer for speaker diarization
 try:
@@ -37,12 +37,13 @@ except ImportError:
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000          # Whisper expects 16kHz
-CHUNK_DURATION = 4.0         # Seconds per transcription chunk
-OVERLAP_DURATION = 0.5       # Overlap between chunks for continuity
+CHUNK_DURATION = 6.0         # Seconds per transcription chunk (longer = more context)
+OVERLAP_DURATION = 1.0       # Overlap between chunks for continuity
 SILENCE_THRESHOLD = 0.005    # RMS threshold for silence detection
-WHISPER_MODEL = "base"       # Options: tiny, base, small, medium, large-v3
+WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"  # GPU-accelerated MLX model
 SPEAKER_SIMILARITY = 0.75    # Cosine similarity threshold for same speaker
 MAX_SPEAKERS = 10            # Maximum number of speakers to track
+SUPPORTED_LANGUAGES = ["ko", "en", "es"]  # Korean, English, Spanish only
 
 # ─── Global State ────────────────────────────────────────────────────────────
 
@@ -149,18 +150,17 @@ class SpeakerTracker:
 class LiveTranscriber:
     """Main live transcription engine."""
 
-    def __init__(self, device_index, model_size=WHISPER_MODEL):
+    def __init__(self, device_index, model_repo=WHISPER_MODEL):
         self.device_index = device_index
         self.speaker_tracker = SpeakerTracker()
         self.last_speaker = None
         self.transcript_lines = []
+        self.model_repo = model_repo
 
-        print(f"Loading Whisper model '{model_size}'...")
-        self.model = WhisperModel(
-            model_size,
-            device="cpu",
-            compute_type="int8",
-        )
+        print(f"Loading Whisper model '{model_repo}' (GPU-accelerated)...")
+        # Warm up the model by running a dummy transcription
+        dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        mlx_whisper.transcribe(dummy, path_or_hf_repo=model_repo, language="en", temperature=0.0)
         print("Whisper model ready.\n")
 
     def audio_callback(self, indata, frames, time_info, status):
@@ -195,25 +195,36 @@ class LiveTranscriber:
 
             # Transcribe
             try:
-                segments, info = self.model.transcribe(
+                # First pass: detect language from supported set
+                detect_result = mlx_whisper.transcribe(
+                    audio_data, path_or_hf_repo=self.model_repo,
+                    temperature=0.0,
+                )
+                detected = detect_result["language"] if detect_result["language"] in SUPPORTED_LANGUAGES else "en"
+
+                # Second pass: transcribe with locked language for accuracy
+                # Uses greedy decoding (temp=0) with fallback temperatures
+                result = mlx_whisper.transcribe(
                     audio_data,
-                    beam_size=5,
-                    language=None,  # Auto-detect language
-                    vad_filter=True,
-                    vad_parameters=dict(
-                        min_silence_duration_ms=300,
-                        speech_pad_ms=200,
-                    ),
+                    path_or_hf_repo=self.model_repo,
+                    language=detected,
+                    temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+                    condition_on_previous_text=False,
+                    compression_ratio_threshold=2.4,
+                    logprob_threshold=-1.0,
+                    no_speech_threshold=0.6,
                 )
 
-                for segment in segments:
-                    text = segment.text.strip()
+                lang = result["language"] or "??"
+
+                for segment in result["segments"]:
+                    text = segment["text"].strip()
                     if not text or len(text) < 2:
                         continue
 
                     # Get the audio portion for this segment
-                    start_sample = int(segment.start * SAMPLE_RATE)
-                    end_sample = min(int(segment.end * SAMPLE_RATE), len(audio_data))
+                    start_sample = int(segment["start"] * SAMPLE_RATE)
+                    end_sample = min(int(segment["end"] * SAMPLE_RATE), len(audio_data))
                     segment_audio = audio_data[start_sample:end_sample]
 
                     # Identify speaker
@@ -228,14 +239,13 @@ class LiveTranscriber:
                         self.last_speaker = speaker
 
                     # Print transcribed text
-                    lang = info.language if info.language else "??"
                     print(f"  \033[0;37m{text}\033[0m  \033[0;90m[{lang}]\033[0m")
 
                     self.transcript_lines.append({
                         "time": timestamp,
                         "speaker": speaker,
                         "text": text,
-                        "language": info.language,
+                        "language": lang,
                     })
 
             except Exception as e:
