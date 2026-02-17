@@ -48,3 +48,4 @@ app.*.map.json
 /android/app/release
 
 /live_transcript/transcripts
+/live_transcript/live_transcript_env
