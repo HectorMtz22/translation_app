@@ -256,8 +256,11 @@ class LiveTranscriber:
         if not self.transcript_lines:
             return
 
+        import os
+        transcript_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
+        os.makedirs(transcript_dir, exist_ok=True)
         filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        filepath = f"/Users/kilo/dev/translation_app/{filename}"
+        filepath = os.path.join(transcript_dir, filename)
         with open(filepath, "w") as f:
             f.write(f"Transcript - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 60 + "\n\n")
