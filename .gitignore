@@ -47,5 +47,5 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
-/live_transcript/transcripts
-/live_transcript/live_transcript_env
+/live_transcribe/transcripts
+/live_transcribe/live_transcribe_env
