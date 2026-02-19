@@ -41,8 +41,10 @@ CHUNK_DURATION = 6.0         # Seconds per transcription chunk (longer = more co
 OVERLAP_DURATION = 1.0       # Overlap between chunks for continuity
 SILENCE_THRESHOLD = 0.005    # RMS threshold for silence detection
 WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"  # GPU-accelerated MLX model
-SPEAKER_SIMILARITY = 0.75    # Cosine similarity threshold for same speaker
-MAX_SPEAKERS = 10            # Maximum number of speakers to track
+SPEAKER_SIMILARITY = 0.82    # Cosine similarity threshold for same speaker
+NUM_SPEAKERS = 5             # Expected number of speakers (once reached, assigns to closest match)
+MAX_SPEAKERS = 5             # Maximum number of speakers to track
+MIN_CHUNKS_NEW_SPEAKER = 2   # Require N consecutive unmatched chunks before creating a new speaker
 SUPPORTED_LANGUAGES = ["ko", "en", "es"]  # Korean, English, Spanish only
 
 # ─── Global State ────────────────────────────────────────────────────────────
@@ -87,6 +89,8 @@ class SpeakerTracker:
             self.encoder = None
         self.speaker_embeddings = []  # List of (label, embedding) tuples
         self.speaker_count = 0
+        self.unmatched_streak = 0      # Consecutive chunks that didn't match any speaker
+        self.pending_embedding = None  # Embedding accumulator for potential new speaker
 
     def identify_speaker(self, audio_chunk):
         """Identify or register a speaker from an audio chunk."""
@@ -126,17 +130,35 @@ class SpeakerTracker:
                             0.8 * known_emb + 0.2 * embedding,
                         )
                         break
+                self.unmatched_streak = 0
+                self.pending_embedding = None
                 return best_match
 
-            # New speaker detected
-            if self.speaker_count < MAX_SPEAKERS:
-                self.speaker_count += 1
-                label = f"Speaker {self.speaker_count}"
-                self.speaker_embeddings.append((label, embedding))
-                return label
-            else:
-                # Too many speakers, assign to closest
+            # No good match — decide whether to create a new speaker
+            # If we've already reached the expected number of speakers, assign to closest
+            if self.speaker_count >= NUM_SPEAKERS:
                 return best_match if best_match else "Speaker ?"
+
+            # Require multiple consecutive unmatched chunks before creating a new speaker
+            self.unmatched_streak += 1
+            if self.pending_embedding is None:
+                self.pending_embedding = embedding
+            else:
+                self.pending_embedding = 0.5 * self.pending_embedding + 0.5 * embedding
+
+            if self.unmatched_streak >= MIN_CHUNKS_NEW_SPEAKER:
+                if self.speaker_count < MAX_SPEAKERS:
+                    self.speaker_count += 1
+                    label = f"Speaker {self.speaker_count}"
+                    self.speaker_embeddings.append((label, self.pending_embedding))
+                    self.unmatched_streak = 0
+                    self.pending_embedding = None
+                    return label
+
+            # Not enough evidence yet for a new speaker — assign to closest existing
+            if best_match:
+                return best_match
+            return self._last_speaker_label()
 
         except Exception as e:
             return self._last_speaker_label()
