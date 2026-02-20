@@ -15,16 +15,21 @@ Setup:
   5. Run: ./live_transcribe_env/bin/python live_transcribe.py
 """
 
+import os
 import sys
 import signal
+import textwrap
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
 import mlx_whisper
+
+from translator import Translator
 
 # Try to import resemblyzer for speaker diarization
 try:
@@ -175,9 +180,12 @@ class LiveTranscriber:
     def __init__(self, device_index, model_repo=WHISPER_MODEL):
         self.device_index = device_index
         self.speaker_tracker = SpeakerTracker()
+        self.translator = Translator()
         self.last_speaker = None
         self.transcript_lines = []
         self.model_repo = model_repo
+        self.print_lock = threading.Lock()
+        self.translation_pool = ThreadPoolExecutor(max_workers=2)
 
         print(f"Loading Whisper model '{model_repo}' (GPU-accelerated)...")
         # Warm up the model by running a dummy transcription
@@ -256,29 +264,70 @@ class LiveTranscriber:
                     timestamp = datetime.now().strftime("%H:%M:%S")
 
                     if speaker != self.last_speaker:
-                        # New speaker - print header
-                        print(f"\n\033[1;36m[{timestamp}] {speaker}:\033[0m")
+                        # New speaker - print header with separator line
+                        try:
+                            tw = os.get_terminal_size().columns
+                        except OSError:
+                            tw = 120
+                        left_w = tw // 2 - 1
+                        separator = f"\033[0;90m{'─' * left_w}─┼─{'─' * (tw - left_w - 3)}\033[0m"
+                        with self.print_lock:
+                            print(f"\n{separator}")
+                            print(f"\033[1;36m[{timestamp}] {speaker}:\033[0m")
                         self.last_speaker = speaker
 
-                    # Print transcribed text
-                    print(f"  \033[0;37m{text}\033[0m  \033[0;90m[{lang}]\033[0m")
-
-                    self.transcript_lines.append({
+                    # Store transcript entry (translation filled async)
+                    entry = {
                         "time": timestamp,
                         "speaker": speaker,
                         "text": text,
                         "language": lang,
-                    })
+                        "translation": None,
+                    }
+                    self.transcript_lines.append(entry)
+
+                    # Print original text immediately
+                    if lang != "en":
+                        try:
+                            tw = os.get_terminal_size().columns
+                        except OSError:
+                            tw = 120
+                        left_w = tw // 2 - 1
+                        left_lines = textwrap.wrap(f"{text} [{lang}]", width=left_w - 2)
+                        with self.print_lock:
+                            for line in left_lines:
+                                print(f"\033[0;37m  {line:<{left_w - 2}}\033[0;90m │\033[0m")
+                        # Fire async translation
+                        self.translation_pool.submit(self._translate_and_print, entry, left_w)
+                    else:
+                        with self.print_lock:
+                            print(f"  \033[0;37m{text}\033[0m  \033[0;90m[{lang}]\033[0m")
 
             except Exception as e:
                 print(f"\033[0;31m[Error] Transcription failed: {e}\033[0m")
+
+    def _translate_and_print(self, entry, left_w):
+        """Run translation in background and print result."""
+        try:
+            tw_now = os.get_terminal_size().columns
+        except OSError:
+            tw_now = 120
+        left_w = tw_now // 2 - 1
+        right_w = tw_now - left_w - 3
+
+        translation = self.translator.translate_to_english(entry["text"], entry["language"])
+        if translation:
+            entry["translation"] = translation
+            right_lines = textwrap.wrap(translation, width=right_w)
+            with self.print_lock:
+                for line in right_lines:
+                    print(f"\033[0;90m{'':>{left_w}} │ \033[0;33m{line}\033[0m")
 
     def save_transcript(self):
         """Save transcript to file."""
         if not self.transcript_lines:
             return
 
-        import os
         transcript_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
         os.makedirs(transcript_dir, exist_ok=True)
         filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -292,6 +341,8 @@ class LiveTranscriber:
                     current_speaker = line["speaker"]
                     f.write(f"\n[{line['time']}] {current_speaker}:\n")
                 f.write(f"  {line['text']}\n")
+                if line.get("translation"):
+                    f.write(f"  → {line['translation']}\n")
         print(f"\n\033[1;32mTranscript saved to: {filepath}\033[0m")
 
     def start(self):
@@ -309,6 +360,18 @@ class LiveTranscriber:
         print("  Press Ctrl+C to stop and save transcript")
         print("=" * 60)
         print("\nListening...\n")
+
+        # Print column headers
+        try:
+            tw = os.get_terminal_size().columns
+        except OSError:
+            tw = 120
+        left_w = tw // 2 - 1
+        right_w = tw - left_w - 3
+        header_left = "  ORIGINAL"
+        header_right = "ENGLISH TRANSLATION"
+        print(f"\033[1;35m{header_left:<{left_w}} │ {header_right}\033[0m")
+        print(f"\033[0;90m{'━' * left_w}━┿━{'━' * right_w}\033[0m")
 
         # Start audio stream
         stream = sd.InputStream(
@@ -342,6 +405,7 @@ class LiveTranscriber:
             stream.close()
             running = False
             process_thread.join(timeout=5)
+            self.translation_pool.shutdown(wait=True, cancel_futures=False)
             self.save_transcript()
             print("Done.")
 
