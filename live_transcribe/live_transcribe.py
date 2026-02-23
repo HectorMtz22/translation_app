@@ -330,16 +330,19 @@ class LiveTranscriber:
                     print(f"\033[0;90m{'':>{left_w}} │ \033[0;33m{line}\033[0m")
 
     def save_transcript(self):
-        """Save transcript to file."""
+        """Save transcript to separate original and English translation files."""
         if not self.transcript_lines:
             return
 
         transcript_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
         os.makedirs(transcript_dir, exist_ok=True)
-        filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        filepath = os.path.join(transcript_dir, filename)
-        with open(filepath, "w") as f:
-            f.write(f"Transcript - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        header_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Save original transcript
+        original_path = os.path.join(transcript_dir, f"transcript_{timestamp}_original.txt")
+        with open(original_path, "w") as f:
+            f.write(f"Transcript (Original) - {header_time}\n")
             f.write("=" * 60 + "\n\n")
             current_speaker = None
             for line in self.transcript_lines:
@@ -347,9 +350,23 @@ class LiveTranscriber:
                     current_speaker = line["speaker"]
                     f.write(f"\n[{line['time']}] {current_speaker}:\n")
                 f.write(f"  {line['text']}\n")
-                if line.get("translation"):
-                    f.write(f"  → {line['translation']}\n")
-        print(f"\n\033[1;32mTranscript saved to: {filepath}\033[0m")
+
+        # Save English translation
+        has_translations = any(line.get("translation") for line in self.transcript_lines)
+        if has_translations:
+            english_path = os.path.join(transcript_dir, f"transcript_{timestamp}_english.txt")
+            with open(english_path, "w") as f:
+                f.write(f"Transcript (English) - {header_time}\n")
+                f.write("=" * 60 + "\n\n")
+                current_speaker = None
+                for line in self.transcript_lines:
+                    if line["speaker"] != current_speaker:
+                        current_speaker = line["speaker"]
+                        f.write(f"\n[{line['time']}] {current_speaker}:\n")
+                    f.write(f"  {line.get('translation') or line['text']}\n")
+            print(f"\n\033[1;32mTranscripts saved to:\n  {original_path}\n  {english_path}\033[0m")
+        else:
+            print(f"\n\033[1;32mTranscript saved to: {original_path}\033[0m")
 
     def start(self):
         """Start live transcription."""
