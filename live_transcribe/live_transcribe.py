@@ -15,6 +15,7 @@ Setup:
   5. Run: ./live_transcribe_env/bin/python live_transcribe.py
 """
 
+import argparse
 import os
 import sys
 import signal
@@ -69,16 +70,21 @@ def find_blackhole_device():
     return None, None
 
 
-def list_input_devices():
-    """List all available input devices."""
+def list_input_devices(default_idx=None):
+    """List all available input devices, highlighting the default."""
     devices = sd.query_devices()
     print("\nAvailable input devices:")
     print("-" * 60)
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0:
-            marker = " <-- BlackHole" if "blackhole" in dev["name"].lower() else ""
+            markers = []
+            if "blackhole" in dev["name"].lower():
+                markers.append("BlackHole")
+            if i == default_idx:
+                markers.append("default")
+            suffix = f"  <-- [{', '.join(markers)}]" if markers else ""
             print(f"  [{i}] {dev['name']} ({dev['max_input_channels']}ch, "
-                  f"{dev['default_samplerate']:.0f}Hz){marker}")
+                  f"{dev['default_samplerate']:.0f}Hz){suffix}")
     print()
 
 
@@ -411,31 +417,35 @@ class LiveTranscriber:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Live system audio transcription with speaker diarization")
+    parser.add_argument("-d", "--device", type=int, default=None,
+                        help="Input device index (skip interactive prompt)")
+    args = parser.parse_args()
+
     print("\n\033[1mLive Transcribe - System Audio\033[0m\n")
 
-    # Find BlackHole device
-    device_idx, device_name = find_blackhole_device()
+    if args.device is not None:
+        # CLI flag provided — use directly
+        device_idx = args.device
+        dev_info = sd.query_devices(device_idx)
+        print(f"Using device: [{device_idx}] {dev_info['name']}")
+    else:
+        # Determine default: prefer BlackHole, fall back to system default input
+        bh_idx, bh_name = find_blackhole_device()
+        if bh_idx is not None:
+            default_idx = bh_idx
+        else:
+            default_idx = sd.default.device[0]  # system default input
 
-    if device_idx is None:
-        print("\033[0;31mBlackHole device not found!\033[0m")
-        print("\nMake sure you have:")
-        print("  1. Installed BlackHole: brew install --cask blackhole-2ch")
-        print("  2. Rebooted your Mac")
-        print("  3. Created a Multi-Output Device in Audio MIDI Setup")
-        print("     (combining your speakers + BlackHole 2ch)")
-        print("  4. Set the Multi-Output Device as system output")
-        list_input_devices()
+        list_input_devices(default_idx)
 
-        # Allow manual device selection
         try:
-            choice = input("Enter device index to use (or 'q' to quit): ").strip()
+            choice = input(f"Select device index [Enter={default_idx}]: ").strip()
             if choice.lower() == "q":
                 sys.exit(0)
-            device_idx = int(choice)
+            device_idx = int(choice) if choice else default_idx
         except (ValueError, EOFError):
             sys.exit(1)
-    else:
-        print(f"Found BlackHole device: [{device_idx}] {device_name}")
 
     # Start transcription
     transcriber = LiveTranscriber(device_idx)
