@@ -31,6 +31,7 @@ import sounddevice as sd
 import mlx_whisper
 
 from translator import Translator
+from deepl_translator import DeepLTranslator
 
 # Try to import resemblyzer for speaker diarization
 try:
@@ -183,10 +184,10 @@ class SpeakerTracker:
 class LiveTranscriber:
     """Main live transcription engine."""
 
-    def __init__(self, device_index, model_repo=WHISPER_MODEL):
+    def __init__(self, device_index, translator=None, model_repo=WHISPER_MODEL):
         self.device_index = device_index
         self.speaker_tracker = SpeakerTracker()
-        self.translator = Translator()
+        self.translator = translator or Translator()
         self.last_speaker = None
         self.transcript_lines = []
         self.model_repo = model_repo
@@ -437,6 +438,8 @@ def main():
     parser = argparse.ArgumentParser(description="Live system audio transcription with speaker diarization")
     parser.add_argument("-d", "--device", type=int, default=None,
                         help="Input device index (skip interactive prompt)")
+    parser.add_argument("-t", "--translator", choices=["google", "deepl"], default=None,
+                        help="Translation service (skip interactive prompt)")
     args = parser.parse_args()
 
     print("\n\033[1mLive Transcribe - System Audio\033[0m\n")
@@ -464,8 +467,33 @@ def main():
         except (ValueError, EOFError):
             sys.exit(1)
 
+    # Select translation service
+    if args.translator is not None:
+        translator_choice = args.translator
+    else:
+        print("\nTranslation service:")
+        print("-" * 40)
+        print("  [1] Google Translate")
+        print("  [2] DeepL")
+        print()
+        try:
+            t_choice = input("Select translation service [Enter=1]: ").strip()
+            if t_choice == "2":
+                translator_choice = "deepl"
+            else:
+                translator_choice = "google"
+        except (ValueError, EOFError):
+            translator_choice = "google"
+
+    if translator_choice == "deepl":
+        translator = DeepLTranslator()
+        print(f"Using translator: DeepL")
+    else:
+        translator = Translator()
+        print(f"Using translator: Google Translate")
+
     # Start transcription
-    transcriber = LiveTranscriber(device_idx)
+    transcriber = LiveTranscriber(device_idx, translator=translator)
     transcriber.start()
 
 
