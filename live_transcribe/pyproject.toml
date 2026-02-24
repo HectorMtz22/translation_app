@@ -1,0 +1,16 @@
+[project]
+name = "live-transcribe"
+version = "0.1.0"
+description = "Live system audio transcription with speaker diarization"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "sounddevice",
+    "mlx-whisper",
+    "resemblyzer",
+    "deep-translator",
+    "deepl",
+]
+
+[project.scripts]
+live-transcribe = "live_transcribe:main"

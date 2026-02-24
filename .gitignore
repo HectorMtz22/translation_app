@@ -47,5 +47,7 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+__pycache__
 /live_transcribe/transcripts
 /live_transcribe/live_transcribe_env
+/live_transcribe/live_transcribe.egg-info
