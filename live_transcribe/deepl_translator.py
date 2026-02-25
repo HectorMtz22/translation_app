@@ -7,6 +7,9 @@ except ImportError:
     DEEPL_AVAILABLE = False
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class DeepLTranslator:
@@ -29,7 +32,7 @@ class DeepLTranslator:
         api_key = os.environ.get("DEEPL_API_KEY")
         if not api_key:
             print("[WARN] DEEPL_API_KEY not set - DeepL translation disabled")
-            print("       Set with: export DEEPL_API_KEY=your_key")
+            print("       Set DEEPL_API_KEY in .env file")
             self.client = None
             return
 

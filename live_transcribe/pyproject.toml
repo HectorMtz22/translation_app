@@ -10,6 +10,7 @@ dependencies = [
     "resemblyzer",
     "deep-translator",
     "deepl",
+    "python-dotenv",
 ]
 
 [project.scripts]
