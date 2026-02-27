@@ -6,6 +6,9 @@ Captures system audio via BlackHole virtual audio device,
 transcribes using mlx-whisper (GPU-accelerated on Apple Silicon),
 and separates speakers using resemblyzer voice embeddings.
 
+Uses Silero VAD for voice activity detection to trigger transcription
+on natural speech boundaries instead of fixed time windows.
+
 Setup:
   1. Install BlackHole 2ch: brew install --cask blackhole-2ch
   2. Reboot Mac
@@ -22,13 +25,14 @@ import signal
 import textwrap
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
 import mlx_whisper
+import torch
 
 from translator import Translator
 from deepl_translator import DeepLTranslator
@@ -44,9 +48,6 @@ except ImportError:
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000          # Whisper expects 16kHz
-CHUNK_DURATION = 6.0         # Seconds per transcription chunk (longer = more context)
-OVERLAP_DURATION = 1.0       # Overlap between chunks for continuity
-SILENCE_THRESHOLD = 0.005    # RMS threshold for silence detection
 WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"  # GPU-accelerated MLX model
 SPEAKER_SIMILARITY = 0.82    # Cosine similarity threshold for same speaker
 NUM_SPEAKERS = 5             # Expected number of speakers (once reached, assigns to closest match)
@@ -54,10 +55,17 @@ MAX_SPEAKERS = 5             # Maximum number of speakers to track
 MIN_CHUNKS_NEW_SPEAKER = 2   # Require N consecutive unmatched chunks before creating a new speaker
 SUPPORTED_LANGUAGES = ["ko", "en", "es"]  # Korean, English, Spanish only
 
+# ─── VAD Configuration ──────────────────────────────────────────────────────
+
+VAD_THRESHOLD = 0.5          # Speech probability threshold
+MIN_SPEECH_DURATION = 0.5    # Ignore speech segments shorter than this (seconds)
+MAX_SPEECH_DURATION = 15.0   # Force transcription after this much continuous speech (seconds)
+SILENCE_AFTER_SPEECH = 0.6   # Pause duration to trigger end-of-speech (seconds)
+VAD_FRAME_SAMPLES = 512      # Silero VAD frame size (512 samples = 32ms at 16kHz)
+ENERGY_THRESHOLD = 0.005     # Minimum RMS energy to consider as real speech (not background noise)
+
 # ─── Global State ────────────────────────────────────────────────────────────
 
-audio_buffer = deque(maxlen=int(SAMPLE_RATE * 60))  # 60s rolling buffer
-chunk_buffer = []
 running = True
 lock = threading.Lock()
 
@@ -87,6 +95,18 @@ def list_input_devices(default_idx=None):
             print(f"  [{i}] {dev['name']} ({dev['max_input_channels']}ch, "
                   f"{dev['default_samplerate']:.0f}Hz){suffix}")
     print()
+
+
+def load_vad_model():
+    """Load Silero VAD model from PyTorch Hub."""
+    print("Loading Silero VAD model...")
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        trust_repo=True,
+    )
+    print("VAD model ready.")
+    return model
 
 
 class SpeakerTracker:
@@ -182,7 +202,7 @@ class SpeakerTracker:
 
 
 class LiveTranscriber:
-    """Main live transcription engine."""
+    """Main live transcription engine with VAD-driven segmentation."""
 
     def __init__(self, device_index, translator=None, model_repo=WHISPER_MODEL):
         self.device_index = device_index
@@ -193,6 +213,15 @@ class LiveTranscriber:
         self.model_repo = model_repo
         self.print_lock = threading.Lock()
         self.translation_pool = ThreadPoolExecutor(max_workers=2)
+
+        # VAD state
+        self.vad_model = load_vad_model()
+        self.audio_queue = deque()  # Raw audio frames waiting for VAD processing
+        self.speech_buffer = []     # Accumulated audio during speech
+        self.is_speaking = False
+        self.speech_start_time = 0.0
+        self.silence_start_time = 0.0
+        self.vad_lock = threading.Lock()
 
         print(f"Loading Whisper model '{model_repo}' (GPU-accelerated)...")
         # Warm up the model by running a dummy transcription
@@ -205,113 +234,200 @@ class LiveTranscriber:
         if status:
             pass  # Ignore overflow warnings silently
         audio = indata[:, 0].copy()  # Mono
-        with lock:
-            chunk_buffer.extend(audio.tolist())
+        with self.vad_lock:
+            self.audio_queue.append(audio)
 
     def process_audio(self):
-        """Process accumulated audio chunks."""
+        """Process audio through VAD and trigger transcription on speech boundaries."""
         global running
 
-        samples_per_chunk = int(SAMPLE_RATE * CHUNK_DURATION)
-        overlap_samples = int(SAMPLE_RATE * OVERLAP_DURATION)
-
         while running:
-            with lock:
-                if len(chunk_buffer) < samples_per_chunk:
-                    time.sleep(0.1)
+            # Grab any queued audio
+            with self.vad_lock:
+                if not self.audio_queue:
+                    time.sleep(0.01)
                     continue
-                # Extract chunk with overlap
-                audio_data = np.array(chunk_buffer[:samples_per_chunk], dtype=np.float32)
-                # Keep overlap for continuity
-                del chunk_buffer[:samples_per_chunk - overlap_samples]
+                chunks = list(self.audio_queue)
+                self.audio_queue.clear()
 
-            # Skip silence
-            rms = np.sqrt(np.mean(audio_data ** 2))
-            if rms < SILENCE_THRESHOLD:
-                continue
+            # Concatenate all queued audio into one array
+            raw_audio = np.concatenate(chunks)
 
-            # Transcribe
-            try:
-                # First pass: detect language from supported set
-                detect_result = mlx_whisper.transcribe(
-                    audio_data, path_or_hf_repo=self.model_repo,
-                    temperature=0.0,
-                )
-                detected = detect_result["language"] if detect_result["language"] in SUPPORTED_LANGUAGES else "en"
+            # Process in VAD_FRAME_SAMPLES-sized frames
+            offset = 0
+            while offset + VAD_FRAME_SAMPLES <= len(raw_audio):
+                frame = raw_audio[offset:offset + VAD_FRAME_SAMPLES]
+                offset += VAD_FRAME_SAMPLES
 
-                # Second pass: transcribe with locked language for accuracy
-                # Uses greedy decoding (temp=0) with fallback temperatures
-                result = mlx_whisper.transcribe(
-                    audio_data,
-                    path_or_hf_repo=self.model_repo,
-                    language=detected,
-                    temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
-                    condition_on_previous_text=False,
-                    compression_ratio_threshold=2.4,
-                    logprob_threshold=-1.0,
-                    no_speech_threshold=0.6,
-                )
+                # Run VAD on this frame
+                frame_tensor = torch.from_numpy(frame).float()
+                speech_prob = self.vad_model(frame_tensor, SAMPLE_RATE).item()
 
-                lang = result["language"] or "??"
+                now = time.monotonic()
 
-                for segment in result["segments"]:
-                    text = segment["text"].strip()
-                    if not text or len(text) < 2:
-                        continue
+                if speech_prob >= VAD_THRESHOLD:
+                    # Speech detected
+                    if not self.is_speaking:
+                        self.is_speaking = True
+                        self.speech_start_time = now
+                    self.silence_start_time = 0.0
+                    self.speech_buffer.append(frame)
 
-                    # Get the audio portion for this segment
-                    start_sample = int(segment["start"] * SAMPLE_RATE)
-                    end_sample = min(int(segment["end"] * SAMPLE_RATE), len(audio_data))
-                    segment_audio = audio_data[start_sample:end_sample]
+                    # Force transcription if speech is too long
+                    speech_duration = now - self.speech_start_time
+                    if speech_duration >= MAX_SPEECH_DURATION:
+                        self._flush_speech_buffer()
 
-                    # Identify speaker
-                    speaker = self.speaker_tracker.identify_speaker(segment_audio)
+                else:
+                    # Silence / non-speech
+                    if self.is_speaking:
+                        # Still accumulate audio during short pauses
+                        self.speech_buffer.append(frame)
 
-                    # Format and print
-                    timestamp = datetime.now().strftime("%H:%M:%S")
+                        if self.silence_start_time == 0.0:
+                            self.silence_start_time = now
+                        elif now - self.silence_start_time >= SILENCE_AFTER_SPEECH:
+                            # Enough silence after speech — trigger transcription
+                            self._flush_speech_buffer()
 
-                    if speaker != self.last_speaker:
-                        # New speaker - print header with separator line
-                        try:
-                            tw = os.get_terminal_size().columns
-                        except OSError:
-                            tw = 120
-                        left_w = tw // 2 - 1
-                        separator = f"\033[0;90m{'─' * left_w}─┼─{'─' * (tw - left_w - 3)}\033[0m"
-                        with self.print_lock:
-                            print(f"\n{separator}")
-                            print(f"\033[1;36m[{timestamp}] {speaker}:\033[0m")
-                        self.last_speaker = speaker
+            # Keep any leftover samples for the next iteration
+            remainder = len(raw_audio) - offset
+            if remainder > 0:
+                with self.vad_lock:
+                    self.audio_queue.appendleft(raw_audio[offset:])
 
-                    # Store transcript entry (translation filled async)
-                    entry = {
-                        "time": timestamp,
-                        "speaker": speaker,
-                        "text": text,
-                        "language": lang,
-                        "translation": None,
-                    }
-                    self.transcript_lines.append(entry)
+    def _flush_speech_buffer(self):
+        """Send accumulated speech buffer to transcription and reset VAD state."""
+        if not self.speech_buffer:
+            self.is_speaking = False
+            self.silence_start_time = 0.0
+            return
 
-                    # Print original text immediately
-                    if lang != "en":
-                        try:
-                            tw = os.get_terminal_size().columns
-                        except OSError:
-                            tw = 120
-                        left_w = tw // 2 - 1
-                        left_lines = textwrap.wrap(f"{text} [{lang}]", width=left_w - 2)
-                        with self.print_lock:
-                            for line in left_lines:
-                                print(f"\033[0;37m  {line:<{left_w - 2}}\033[0;90m │\033[0m")
-                        # Fire async translation
-                        self.translation_pool.submit(self._translate_and_print, entry, left_w)
-                    else:
-                        with self.print_lock:
-                            print(f"  \033[0;37m{text}\033[0m  \033[0;90m[{lang}]\033[0m")
+        audio_data = np.concatenate(self.speech_buffer).astype(np.float32)
 
-            except Exception as e:
-                print(f"\033[0;31m[Error] Transcription failed: {e}\033[0m")
+        # Reset VAD state
+        self.speech_buffer = []
+        self.is_speaking = False
+        self.silence_start_time = 0.0
+        self.vad_model.reset_states()
+
+        # Check minimum speech duration
+        duration = len(audio_data) / SAMPLE_RATE
+        if duration < MIN_SPEECH_DURATION:
+            return
+
+        # Check energy level — reject quiet noise that slipped past VAD
+        rms = np.sqrt(np.mean(audio_data ** 2))
+        if rms < ENERGY_THRESHOLD:
+            return
+
+        self._transcribe_segment(audio_data)
+
+    @staticmethod
+    def _is_hallucination(text):
+        """Detect Whisper hallucination patterns (repetitive short tokens)."""
+        stripped = text.strip()
+        if not stripped:
+            return True
+        # Split into words/tokens
+        tokens = stripped.split()
+        if len(tokens) < 3:
+            # For very short text, check if it's just repeated characters
+            # e.g. "와와" or "aaaa"
+            unique_chars = set(stripped.replace(" ", ""))
+            if len(unique_chars) <= 2 and len(stripped) > 1:
+                return True
+            return False
+        # Check if most tokens are the same (repetitive hallucination)
+        unique_tokens = set(tokens)
+        if len(unique_tokens) <= 2 and len(tokens) >= 4:
+            return True
+        # Check if any single token dominates (>70% of all tokens)
+        counts = Counter(tokens)
+        most_common_count = counts.most_common(1)[0][1]
+        if most_common_count / len(tokens) > 0.7 and len(tokens) >= 4:
+            return True
+        return False
+
+    def _transcribe_segment(self, audio_data):
+        """Transcribe an audio segment with single-pass Whisper."""
+        try:
+            result = mlx_whisper.transcribe(
+                audio_data,
+                path_or_hf_repo=self.model_repo,
+                temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+                condition_on_previous_text=False,
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.5,
+            )
+
+            lang = result.get("language", "??")
+            if lang not in SUPPORTED_LANGUAGES:
+                lang = "en"
+
+            for segment in result["segments"]:
+                text = segment["text"].strip()
+                if not text or len(text) < 2:
+                    continue
+
+                # Filter out Whisper hallucinations
+                if self._is_hallucination(text):
+                    continue
+
+                # Get the audio portion for this segment for speaker ID
+                start_sample = int(segment["start"] * SAMPLE_RATE)
+                end_sample = min(int(segment["end"] * SAMPLE_RATE), len(audio_data))
+                segment_audio = audio_data[start_sample:end_sample]
+
+                # Identify speaker
+                speaker = self.speaker_tracker.identify_speaker(segment_audio)
+
+                # Format and print
+                timestamp = datetime.now().strftime("%H:%M:%S")
+
+                if speaker != self.last_speaker:
+                    # New speaker - print header with separator line
+                    try:
+                        tw = os.get_terminal_size().columns
+                    except OSError:
+                        tw = 120
+                    left_w = tw // 2 - 1
+                    separator = f"\033[0;90m{'─' * left_w}─┼─{'─' * (tw - left_w - 3)}\033[0m"
+                    with self.print_lock:
+                        print(f"\n{separator}")
+                        print(f"\033[1;36m[{timestamp}] {speaker}:\033[0m")
+                    self.last_speaker = speaker
+
+                # Store transcript entry (translation filled async)
+                entry = {
+                    "time": timestamp,
+                    "speaker": speaker,
+                    "text": text,
+                    "language": lang,
+                    "translation": None,
+                }
+                self.transcript_lines.append(entry)
+
+                # Print original text immediately
+                if lang != "en":
+                    try:
+                        tw = os.get_terminal_size().columns
+                    except OSError:
+                        tw = 120
+                    left_w = tw // 2 - 1
+                    left_lines = textwrap.wrap(f"{text} [{lang}]", width=left_w - 2)
+                    with self.print_lock:
+                        for line in left_lines:
+                            print(f"\033[0;37m  {line:<{left_w - 2}}\033[0;90m │\033[0m")
+                    # Fire async translation
+                    self.translation_pool.submit(self._translate_and_print, entry, left_w)
+                else:
+                    with self.print_lock:
+                        print(f"  \033[0;37m{text}\033[0m  \033[0;90m[{lang}]\033[0m")
+
+        except Exception as e:
+            print(f"\033[0;31m[Error] Transcription failed: {e}\033[0m")
 
     def _translate_and_print(self, entry, left_w):
         """Run translation in background and print result."""
@@ -378,7 +494,9 @@ class LiveTranscriber:
         print("=" * 60)
         print(f"  Audio device: {sd.query_devices(self.device_index)['name']}")
         print(f"  Whisper model: {WHISPER_MODEL}")
-        print(f"  Chunk duration: {CHUNK_DURATION}s")
+        print(f"  VAD threshold: {VAD_THRESHOLD}")
+        print(f"  Silence trigger: {SILENCE_AFTER_SPEECH}s")
+        print(f"  Max speech segment: {MAX_SPEECH_DURATION}s")
         print(f"  Speaker diarization: {'ON' if DIARIZATION_AVAILABLE else 'OFF'}")
         print("=" * 60)
         print("  Press Ctrl+C to stop and save transcript")
@@ -403,7 +521,7 @@ class LiveTranscriber:
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
-            blocksize=int(SAMPLE_RATE * 0.5),  # 500ms blocks
+            blocksize=int(SAMPLE_RATE * 0.1),  # 100ms blocks (smaller for lower latency)
             callback=self.audio_callback,
         )
 

@@ -11,6 +11,8 @@ dependencies = [
     "deep-translator",
     "deepl",
     "python-dotenv",
+    "torch",
+    "torchaudio",
 ]
 
 [project.scripts]
