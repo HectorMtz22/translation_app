@@ -325,7 +325,7 @@ class LiveTranscriber:
 
     @staticmethod
     def _is_hallucination(text):
-        """Detect Whisper hallucination patterns (repetitive short tokens)."""
+        """Detect Whisper hallucination patterns (repetitive tokens or phrases)."""
         stripped = text.strip()
         if not stripped:
             return True
@@ -347,6 +347,13 @@ class LiveTranscriber:
         most_common_count = counts.most_common(1)[0][1]
         if most_common_count / len(tokens) > 0.7 and len(tokens) >= 4:
             return True
+        # Detect repeating n-gram phrases (e.g. "A B C A B C A B C")
+        for n in range(2, min(len(tokens) // 2 + 1, 8)):
+            ngrams = [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
+            ngram_counts = Counter(ngrams)
+            most_common_ngram, mc_count = ngram_counts.most_common(1)[0]
+            if mc_count >= 3 and (mc_count * len(most_common_ngram)) / len(tokens) > 0.5:
+                return True
         return False
 
     def _transcribe_segment(self, audio_data):
@@ -357,18 +364,26 @@ class LiveTranscriber:
                 path_or_hf_repo=self.model_repo,
                 temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
                 condition_on_previous_text=False,
-                compression_ratio_threshold=2.4,
-                logprob_threshold=-1.0,
-                no_speech_threshold=0.5,
+                compression_ratio_threshold=1.8,
+                logprob_threshold=-0.5,
+                no_speech_threshold=0.6,
             )
 
             lang = result.get("language", "??")
             if lang not in SUPPORTED_LANGUAGES:
-                lang = "en"
+                # Whisper detected an unsupported language — likely misdetection,
+                # discard the entire result since the transcription itself is wrong
+                return
 
             for segment in result["segments"]:
                 text = segment["text"].strip()
                 if not text or len(text) < 2:
+                    continue
+
+                # Filter low-confidence segments using per-segment metrics
+                avg_logprob = segment.get("avg_logprob", 0)
+                no_speech_prob = segment.get("no_speech_prob", 0)
+                if avg_logprob < -0.7 or no_speech_prob > 0.5:
                     continue
 
                 # Filter out Whisper hallucinations
