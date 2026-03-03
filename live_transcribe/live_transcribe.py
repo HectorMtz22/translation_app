@@ -57,12 +57,12 @@ SUPPORTED_LANGUAGES = ["ko", "en", "es"]  # Korean, English, Spanish only
 
 # ─── VAD Configuration ──────────────────────────────────────────────────────
 
-VAD_THRESHOLD = 0.5          # Speech probability threshold
-MIN_SPEECH_DURATION = 0.5    # Ignore speech segments shorter than this (seconds)
+VAD_THRESHOLD = 0.3          # Speech probability threshold (lower = more sensitive)
+MIN_SPEECH_DURATION = 0.3    # Ignore speech segments shorter than this (seconds)
 MAX_SPEECH_DURATION = 15.0   # Force transcription after this much continuous speech (seconds)
-SILENCE_AFTER_SPEECH = 0.6   # Pause duration to trigger end-of-speech (seconds)
+SILENCE_AFTER_SPEECH = 0.5   # Pause duration to trigger end-of-speech (seconds)
 VAD_FRAME_SAMPLES = 512      # Silero VAD frame size (512 samples = 32ms at 16kHz)
-ENERGY_THRESHOLD = 0.005     # Minimum RMS energy to consider as real speech (not background noise)
+ENERGY_THRESHOLD = 0.002     # Minimum RMS energy to consider as real speech (not background noise)
 
 # ─── Global State ────────────────────────────────────────────────────────────
 
@@ -212,7 +212,8 @@ class LiveTranscriber:
         self.transcript_lines = []
         self.model_repo = model_repo
         self.print_lock = threading.Lock()
-        self.translation_pool = ThreadPoolExecutor(max_workers=2)
+        self.transcription_pool = ThreadPoolExecutor(max_workers=1)
+        self.translation_pool = ThreadPoolExecutor(max_workers=4)
 
         # VAD state
         self.vad_model = load_vad_model()
@@ -321,7 +322,7 @@ class LiveTranscriber:
         if rms < ENERGY_THRESHOLD:
             return
 
-        self._transcribe_segment(audio_data)
+        self.transcription_pool.submit(self._transcribe_segment, audio_data)
 
     @staticmethod
     def _is_hallucination(text):
@@ -362,11 +363,11 @@ class LiveTranscriber:
             result = mlx_whisper.transcribe(
                 audio_data,
                 path_or_hf_repo=self.model_repo,
-                temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+                temperature=(0.0, 0.4),
                 condition_on_previous_text=False,
                 compression_ratio_threshold=1.8,
-                logprob_threshold=-0.5,
-                no_speech_threshold=0.6,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.8,
             )
 
             lang = result.get("language", "??")
@@ -383,7 +384,7 @@ class LiveTranscriber:
                 # Filter low-confidence segments using per-segment metrics
                 avg_logprob = segment.get("avg_logprob", 0)
                 no_speech_prob = segment.get("no_speech_prob", 0)
-                if avg_logprob < -0.7 or no_speech_prob > 0.5:
+                if avg_logprob < -1.0 or no_speech_prob > 0.7:
                     continue
 
                 # Filter out Whisper hallucinations
@@ -562,6 +563,7 @@ class LiveTranscriber:
             stream.close()
             running = False
             process_thread.join(timeout=5)
+            self.transcription_pool.shutdown(wait=True, cancel_futures=False)
             self.translation_pool.shutdown(wait=True, cancel_futures=False)
             self.save_transcript()
             print("Done.")
