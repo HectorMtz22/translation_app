@@ -429,10 +429,8 @@ class LiveTranscriber:
                         tw = os.get_terminal_size().columns
                     except OSError:
                         tw = 120
-                    left_w = tw // 2 - 1
-                    separator = f"\033[0;90m{'─' * left_w}─┼─{'─' * (tw - left_w - 3)}\033[0m"
                     with self.print_lock:
-                        print(f"\n{separator}")
+                        print(f"\n\033[0;90m{'─' * tw}\033[0m")
                         print(f"\033[1;36m[{timestamp}] {speaker}:\033[0m")
                     self.last_speaker = speaker
 
@@ -448,26 +446,17 @@ class LiveTranscriber:
 
                 # Print original text with fluid word-by-word effect
                 if self.translator and lang in self.translate_langs:
-                    try:
-                        tw = os.get_terminal_size().columns
-                    except OSError:
-                        tw = 120
-                    left_w = tw // 2 - 1
-                    right_w = tw - left_w - 3
-
                     # Fire translation NOW so it runs during original text animation
                     future = self.translation_pool.submit(
                         self.translator.translate, entry["text"], entry["language"]
                     )
 
-                    left_lines = textwrap.wrap(f"{text} [{lang}]", width=left_w - 2)
                     with self.print_lock:
-                        # Print original text fluid
-                        for line in left_lines:
-                            self._print_fluid_line(
-                                line.split(),
-                                lambda b, lw=left_w: f"\033[0;37m  {b:<{lw - 2}}\033[0;90m │\033[0m",
-                            )
+                        # Print original text
+                        self._print_fluid_line(
+                            f"{text} [{lang}]".split(),
+                            lambda b: f"  \033[0;37m{b}\033[0m",
+                        )
                         # Translation was running in parallel — grab result
                         try:
                             translation = future.result(timeout=5.0)
@@ -475,12 +464,11 @@ class LiveTranscriber:
                             translation = None
                         if translation:
                             entry["translation"] = translation
-                            right_lines = textwrap.wrap(translation, width=right_w)
-                            for line in right_lines:
-                                self._print_fluid_line(
-                                    line.split(),
-                                    lambda b, lw=left_w: f"\033[0;90m{'':>{lw}} │ \033[0;33m{b}\033[0m",
-                                )
+                            self._print_fluid_line(
+                                translation.split(),
+                                lambda b: f"  \033[0;33m→ {b}\033[0m",
+                            )
+                        print()
                 else:
                     with self.print_lock:
                         self._print_fluid_line(
@@ -559,20 +547,6 @@ class LiveTranscriber:
         print("  Press Ctrl+C to stop and save transcript")
         print("=" * 60)
         print("\nListening...\n")
-
-        # Print column headers
-        if self.translator:
-            try:
-                tw = os.get_terminal_size().columns
-            except OSError:
-                tw = 120
-            left_w = tw // 2 - 1
-            right_w = tw - left_w - 3
-            header_left = "  ORIGINAL"
-            target_name = LANG_NAMES.get(self.target_lang, self.target_lang).upper()
-            header_right = f"{target_name} TRANSLATION"
-            print(f"\033[1;35m{header_left:<{left_w}} │ {header_right}\033[0m")
-            print(f"\033[0;90m{'━' * left_w}━┿━{'━' * right_w}\033[0m")
 
         # Start audio stream
         stream = sd.InputStream(
