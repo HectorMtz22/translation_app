@@ -1,4 +1,4 @@
-"""English translation support using DeepL API."""
+"""Translation support using DeepL API."""
 
 try:
     import deepl
@@ -13,7 +13,7 @@ load_dotenv()
 
 
 class DeepLTranslator:
-    """Translates text to English using DeepL API."""
+    """Translates text using DeepL API."""
 
     # Map short language codes to DeepL source language codes
     LANG_MAP = {
@@ -22,7 +22,15 @@ class DeepLTranslator:
         "en": "EN",
     }
 
-    def __init__(self):
+    # Map short language codes to DeepL target language codes
+    TARGET_LANG_MAP = {
+        "en": "EN-US",
+        "ko": "KO",
+        "es": "ES",
+    }
+
+    def __init__(self, target_lang="en"):
+        self.target_lang = target_lang
         if not DEEPL_AVAILABLE:
             print("[WARN] deepl not available - DeepL translation disabled")
             print("       Install with: pip install deepl")
@@ -38,16 +46,17 @@ class DeepLTranslator:
 
         self.client = deepl.Translator(api_key)
 
-    def translate_to_english(self, text, source_lang):
-        """Translate text to English. Returns None if already English or on failure."""
+    def translate(self, text, source_lang):
+        """Translate text to target language. Returns None if same language or on failure."""
         if self.client is None:
             return None
-        if source_lang == "en":
+        if source_lang == self.target_lang:
             return None
         try:
             deepl_lang = self.LANG_MAP.get(source_lang, source_lang.upper())
+            deepl_target = self.TARGET_LANG_MAP.get(self.target_lang, self.target_lang.upper())
             result = self.client.translate_text(
-                text, source_lang=deepl_lang, target_lang="EN-US"
+                text, source_lang=deepl_lang, target_lang=deepl_target
             )
             return str(result) if result else None
         except Exception:

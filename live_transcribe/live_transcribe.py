@@ -54,6 +54,7 @@ NUM_SPEAKERS = 5             # Expected number of speakers (once reached, assign
 MAX_SPEAKERS = 5             # Maximum number of speakers to track
 MIN_CHUNKS_NEW_SPEAKER = 2   # Require N consecutive unmatched chunks before creating a new speaker
 SUPPORTED_LANGUAGES = ["ko", "en", "es"]  # Korean, English, Spanish only
+LANG_NAMES = {"ko": "Korean", "en": "English", "es": "Spanish"}
 
 # ─── VAD Configuration ──────────────────────────────────────────────────────
 
@@ -205,10 +206,13 @@ class SpeakerTracker:
 class LiveTranscriber:
     """Main live transcription engine with VAD-driven segmentation."""
 
-    def __init__(self, device_index, translator=None, model_repo=WHISPER_MODEL):
+    def __init__(self, device_index, translator=None, translate_langs=None,
+                 target_lang="en", model_repo=WHISPER_MODEL):
         self.device_index = device_index
         self.speaker_tracker = SpeakerTracker()
         self.translator = translator
+        self.translate_langs = translate_langs or set()
+        self.target_lang = target_lang
         self.last_speaker = None
         self.transcript_lines = []
         self.model_repo = model_repo
@@ -443,7 +447,7 @@ class LiveTranscriber:
                 self.transcript_lines.append(entry)
 
                 # Print original text with fluid word-by-word effect
-                if lang != "en" and self.translator:
+                if self.translator and lang in self.translate_langs:
                     try:
                         tw = os.get_terminal_size().columns
                     except OSError:
@@ -453,7 +457,7 @@ class LiveTranscriber:
 
                     # Fire translation NOW so it runs during original text animation
                     future = self.translation_pool.submit(
-                        self.translator.translate_to_english, entry["text"], entry["language"]
+                        self.translator.translate, entry["text"], entry["language"]
                     )
 
                     left_lines = textwrap.wrap(f"{text} [{lang}]", width=left_w - 2)
@@ -509,12 +513,14 @@ class LiveTranscriber:
                     f.write(f"\n[{line['time']}] {current_speaker}:\n")
                 f.write(f"  {line['text']}\n")
 
-        # Save English translation
+        # Save translated transcript
         has_translations = any(line.get("translation") for line in self.transcript_lines)
         if has_translations:
-            english_path = os.path.join(transcript_dir, f"transcript_{timestamp}_english.txt")
-            with open(english_path, "w") as f:
-                f.write(f"Transcript (English) - {header_time}\n")
+            target_name = LANG_NAMES.get(self.target_lang, self.target_lang).lower()
+            translated_path = os.path.join(transcript_dir, f"transcript_{timestamp}_{target_name}.txt")
+            target_label = LANG_NAMES.get(self.target_lang, self.target_lang)
+            with open(translated_path, "w") as f:
+                f.write(f"Transcript ({target_label}) - {header_time}\n")
                 f.write("=" * 60 + "\n\n")
                 current_speaker = None
                 for line in self.transcript_lines:
@@ -522,7 +528,7 @@ class LiveTranscriber:
                         current_speaker = line["speaker"]
                         f.write(f"\n[{line['time']}] {current_speaker}:\n")
                     f.write(f"  {line.get('translation') or line['text']}\n")
-            print(f"\n\033[1;32mTranscripts saved to:\n  {original_path}\n  {english_path}\033[0m")
+            print(f"\n\033[1;32mTranscripts saved to:\n  {original_path}\n  {translated_path}\033[0m")
         else:
             print(f"\n\033[1;32mTranscript saved to: {original_path}\033[0m")
 
@@ -539,7 +545,16 @@ class LiveTranscriber:
         print(f"  Silence trigger: {SILENCE_AFTER_SPEECH}s")
         print(f"  Max speech segment: {MAX_SPEECH_DURATION}s")
         print(f"  Speaker diarization: {'ON' if DIARIZATION_AVAILABLE else 'OFF'}")
-        print(f"  Translation: {'OFF' if not self.translator else 'ON'}")
+        if self.translator:
+            from_list = ", ".join(
+                f"{LANG_NAMES.get(l, l)} ({l})" for l in sorted(self.translate_langs)
+            )
+            to_name = f"{LANG_NAMES.get(self.target_lang, self.target_lang)} ({self.target_lang})"
+            print(f"  Translation: ON")
+            print(f"  Translate from: {from_list}")
+            print(f"  Translate to:   {to_name}")
+        else:
+            print(f"  Translation: OFF")
         print("=" * 60)
         print("  Press Ctrl+C to stop and save transcript")
         print("=" * 60)
@@ -554,7 +569,8 @@ class LiveTranscriber:
             left_w = tw // 2 - 1
             right_w = tw - left_w - 3
             header_left = "  ORIGINAL"
-            header_right = "ENGLISH TRANSLATION"
+            target_name = LANG_NAMES.get(self.target_lang, self.target_lang).upper()
+            header_right = f"{target_name} TRANSLATION"
             print(f"\033[1;35m{header_left:<{left_w}} │ {header_right}\033[0m")
             print(f"\033[0;90m{'━' * left_w}━┿━{'━' * right_w}\033[0m")
 
@@ -603,6 +619,10 @@ def main():
                         help="Input device index (skip interactive prompt)")
     parser.add_argument("-t", "--translator", choices=["google", "deepl", "none"], default=None,
                         help="Translation service: google, deepl, or none to disable")
+    parser.add_argument("--translate-from", default=None,
+                        help="Comma-separated source language codes to translate (default: ko)")
+    parser.add_argument("--translate-to", default=None,
+                        help="Target language code (default: en)")
     args = parser.parse_args()
 
     print("\n\033[1mLive Transcribe - System Audio\033[0m\n")
@@ -651,18 +671,76 @@ def main():
         except (ValueError, EOFError):
             translator_choice = "google"
 
+    # Defaults for source/target languages
+    translate_langs = set()
+    target_lang = "en"
+
     if translator_choice == "none":
         translator = None
         print("Using translator: None (disabled)")
-    elif translator_choice == "deepl":
-        translator = DeepLTranslator()
-        print(f"Using translator: DeepL")
     else:
-        translator = Translator()
-        print(f"Using translator: Google Translate")
+        # Determine source languages to translate
+        if args.translate_from is not None:
+            if args.translate_from == "all":
+                translate_langs = set(LANG_NAMES.keys())
+            else:
+                translate_langs = set(args.translate_from.split(","))
+        else:
+            # Interactive multi-select
+            lang_options = list(LANG_NAMES.items())
+            print("\nTranslate FROM (comma-separated, Enter=1):")
+            for i, (code, name) in enumerate(lang_options, 1):
+                print(f"  [{i}] {name} ({code})")
+            print(f"  [*] All")
+            try:
+                choice = input("Select: ").strip()
+                if choice == "*":
+                    translate_langs = {code for code, _ in lang_options}
+                elif choice:
+                    for idx_str in choice.split(","):
+                        idx = int(idx_str.strip()) - 1
+                        if 0 <= idx < len(lang_options):
+                            translate_langs.add(lang_options[idx][0])
+                else:
+                    translate_langs = {"ko"}  # default
+            except (ValueError, EOFError):
+                translate_langs = {"ko"}
+
+        # Determine target language
+        if args.translate_to is not None:
+            target_lang = args.translate_to
+        else:
+            # Interactive single-select
+            lang_options = list(LANG_NAMES.items())
+            print("\nTranslate TO:")
+            for i, (code, name) in enumerate(lang_options, 1):
+                print(f"  [{i}] {name} ({code})")
+            try:
+                choice = input("Select [Enter=1]: ").strip()
+                if choice:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(lang_options):
+                        target_lang = lang_options[idx][0]
+                else:
+                    target_lang = "en"  # default
+            except (ValueError, EOFError):
+                target_lang = "en"
+
+        # Remove target language from source set (no point translating to itself)
+        translate_langs.discard(target_lang)
+
+        if translator_choice == "deepl":
+            translator = DeepLTranslator(target_lang=target_lang)
+            print(f"Using translator: DeepL")
+        else:
+            translator = Translator(target_lang=target_lang)
+            print(f"Using translator: Google Translate")
 
     # Start transcription
-    transcriber = LiveTranscriber(device_idx, translator=translator)
+    transcriber = LiveTranscriber(
+        device_idx, translator=translator,
+        translate_langs=translate_langs, target_lang=target_lang,
+    )
     transcriber.start()
 
 
