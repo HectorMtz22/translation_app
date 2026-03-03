@@ -63,6 +63,7 @@ MAX_SPEECH_DURATION = 15.0   # Force transcription after this much continuous sp
 SILENCE_AFTER_SPEECH = 0.5   # Pause duration to trigger end-of-speech (seconds)
 VAD_FRAME_SAMPLES = 512      # Silero VAD frame size (512 samples = 32ms at 16kHz)
 ENERGY_THRESHOLD = 0.002     # Minimum RMS energy to consider as real speech (not background noise)
+FLUID_WORD_DELAY = 0.04      # Seconds between words for fluid typewriter printing
 
 # ─── Global State ────────────────────────────────────────────────────────────
 
@@ -207,13 +208,13 @@ class LiveTranscriber:
     def __init__(self, device_index, translator=None, model_repo=WHISPER_MODEL):
         self.device_index = device_index
         self.speaker_tracker = SpeakerTracker()
-        self.translator = translator or Translator()
+        self.translator = translator
         self.last_speaker = None
         self.transcript_lines = []
         self.model_repo = model_repo
         self.print_lock = threading.Lock()
         self.transcription_pool = ThreadPoolExecutor(max_workers=1)
-        self.translation_pool = ThreadPoolExecutor(max_workers=4)
+        self.translation_pool = ThreadPoolExecutor(max_workers=4) if translator else None
 
         # VAD state
         self.vad_model = load_vad_model()
@@ -357,6 +358,22 @@ class LiveTranscriber:
                 return True
         return False
 
+    def _print_fluid_line(self, words, format_fn, delay=FLUID_WORD_DELAY):
+        """Print words progressively, rewriting the line for a typewriter effect.
+
+        Must be called while holding self.print_lock.
+        """
+        built = ""
+        for i, word in enumerate(words):
+            if built:
+                built += " "
+            built += word
+            sys.stdout.write(f"\r{format_fn(built)}")
+            sys.stdout.flush()
+            time.sleep(delay)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
     def _transcribe_segment(self, audio_data):
         """Transcribe an audio segment with single-pass Whisper."""
         try:
@@ -425,42 +442,50 @@ class LiveTranscriber:
                 }
                 self.transcript_lines.append(entry)
 
-                # Print original text immediately
-                if lang != "en":
+                # Print original text with fluid word-by-word effect
+                if lang != "en" and self.translator:
                     try:
                         tw = os.get_terminal_size().columns
                     except OSError:
                         tw = 120
                     left_w = tw // 2 - 1
+                    right_w = tw - left_w - 3
+
+                    # Fire translation NOW so it runs during original text animation
+                    future = self.translation_pool.submit(
+                        self.translator.translate_to_english, entry["text"], entry["language"]
+                    )
+
                     left_lines = textwrap.wrap(f"{text} [{lang}]", width=left_w - 2)
                     with self.print_lock:
+                        # Print original text fluid
                         for line in left_lines:
-                            print(f"\033[0;37m  {line:<{left_w - 2}}\033[0;90m │\033[0m")
-                    # Fire async translation
-                    self.translation_pool.submit(self._translate_and_print, entry, left_w)
+                            self._print_fluid_line(
+                                line.split(),
+                                lambda b, lw=left_w: f"\033[0;37m  {b:<{lw - 2}}\033[0;90m │\033[0m",
+                            )
+                        # Translation was running in parallel — grab result
+                        try:
+                            translation = future.result(timeout=5.0)
+                        except Exception:
+                            translation = None
+                        if translation:
+                            entry["translation"] = translation
+                            right_lines = textwrap.wrap(translation, width=right_w)
+                            for line in right_lines:
+                                self._print_fluid_line(
+                                    line.split(),
+                                    lambda b, lw=left_w: f"\033[0;90m{'':>{lw}} │ \033[0;33m{b}\033[0m",
+                                )
                 else:
                     with self.print_lock:
-                        print(f"  \033[0;37m{text}\033[0m  \033[0;90m[{lang}]\033[0m")
+                        self._print_fluid_line(
+                            text.split(),
+                            lambda b, lg=lang: f"  \033[0;37m{b}\033[0m  \033[0;90m[{lg}]\033[0m",
+                        )
 
         except Exception as e:
             print(f"\033[0;31m[Error] Transcription failed: {e}\033[0m")
-
-    def _translate_and_print(self, entry, left_w):
-        """Run translation in background and print result."""
-        try:
-            tw_now = os.get_terminal_size().columns
-        except OSError:
-            tw_now = 120
-        left_w = tw_now // 2 - 1
-        right_w = tw_now - left_w - 3
-
-        translation = self.translator.translate_to_english(entry["text"], entry["language"])
-        if translation:
-            entry["translation"] = translation
-            right_lines = textwrap.wrap(translation, width=right_w)
-            with self.print_lock:
-                for line in right_lines:
-                    print(f"\033[0;90m{'':>{left_w}} │ \033[0;33m{line}\033[0m")
 
     def save_transcript(self):
         """Save transcript to separate original and English translation files."""
@@ -514,22 +539,24 @@ class LiveTranscriber:
         print(f"  Silence trigger: {SILENCE_AFTER_SPEECH}s")
         print(f"  Max speech segment: {MAX_SPEECH_DURATION}s")
         print(f"  Speaker diarization: {'ON' if DIARIZATION_AVAILABLE else 'OFF'}")
+        print(f"  Translation: {'OFF' if not self.translator else 'ON'}")
         print("=" * 60)
         print("  Press Ctrl+C to stop and save transcript")
         print("=" * 60)
         print("\nListening...\n")
 
         # Print column headers
-        try:
-            tw = os.get_terminal_size().columns
-        except OSError:
-            tw = 120
-        left_w = tw // 2 - 1
-        right_w = tw - left_w - 3
-        header_left = "  ORIGINAL"
-        header_right = "ENGLISH TRANSLATION"
-        print(f"\033[1;35m{header_left:<{left_w}} │ {header_right}\033[0m")
-        print(f"\033[0;90m{'━' * left_w}━┿━{'━' * right_w}\033[0m")
+        if self.translator:
+            try:
+                tw = os.get_terminal_size().columns
+            except OSError:
+                tw = 120
+            left_w = tw // 2 - 1
+            right_w = tw - left_w - 3
+            header_left = "  ORIGINAL"
+            header_right = "ENGLISH TRANSLATION"
+            print(f"\033[1;35m{header_left:<{left_w}} │ {header_right}\033[0m")
+            print(f"\033[0;90m{'━' * left_w}━┿━{'━' * right_w}\033[0m")
 
         # Start audio stream
         stream = sd.InputStream(
@@ -564,7 +591,8 @@ class LiveTranscriber:
             running = False
             process_thread.join(timeout=5)
             self.transcription_pool.shutdown(wait=True, cancel_futures=False)
-            self.translation_pool.shutdown(wait=True, cancel_futures=False)
+            if self.translation_pool:
+                self.translation_pool.shutdown(wait=True, cancel_futures=False)
             self.save_transcript()
             print("Done.")
 
@@ -573,8 +601,8 @@ def main():
     parser = argparse.ArgumentParser(description="Live system audio transcription with speaker diarization")
     parser.add_argument("-d", "--device", type=int, default=None,
                         help="Input device index (skip interactive prompt)")
-    parser.add_argument("-t", "--translator", choices=["google", "deepl"], default=None,
-                        help="Translation service (skip interactive prompt)")
+    parser.add_argument("-t", "--translator", choices=["google", "deepl", "none"], default=None,
+                        help="Translation service: google, deepl, or none to disable")
     args = parser.parse_args()
 
     print("\n\033[1mLive Transcribe - System Audio\033[0m\n")
@@ -610,17 +638,23 @@ def main():
         print("-" * 40)
         print("  [1] Google Translate")
         print("  [2] DeepL")
+        print("  [3] None (transcription only)")
         print()
         try:
             t_choice = input("Select translation service [Enter=1]: ").strip()
             if t_choice == "2":
                 translator_choice = "deepl"
+            elif t_choice == "3":
+                translator_choice = "none"
             else:
                 translator_choice = "google"
         except (ValueError, EOFError):
             translator_choice = "google"
 
-    if translator_choice == "deepl":
+    if translator_choice == "none":
+        translator = None
+        print("Using translator: None (disabled)")
+    elif translator_choice == "deepl":
         translator = DeepLTranslator()
         print(f"Using translator: DeepL")
     else:
