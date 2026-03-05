@@ -24,14 +24,27 @@ class Translator:
             self._translators[key] = GoogleTranslator(source=source_lang, target=self.target_lang)
         return self._translators[key]
 
-    def translate(self, text, source_lang):
-        """Translate text to target language. Returns None if same language or on failure."""
+    def translate(self, text, source_lang, context=None):
+        """Translate text to target language. Returns None if same language or on failure.
+
+        If context is provided (list of recent lines), it is prepended to
+        improve translation quality and only the actual translation is returned.
+        """
         if not TRANSLATION_AVAILABLE:
             return None
         if source_lang == self.target_lang:
             return None
         try:
             translator = self._get_translator(source_lang)
+            if context:
+                # Prepend context lines separated by newlines, add a marker
+                # so we can split the result reliably
+                marker = "|||"
+                block = "\n".join(context) + f"\n{marker}\n" + text
+                result = translator.translate(block)
+                if result and marker in result:
+                    return result.split(marker, 1)[1].strip() or None
+                # Fallback: marker got translated/lost, just translate without context
             result = translator.translate(text)
             return result if result else None
         except Exception:

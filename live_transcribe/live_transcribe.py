@@ -20,6 +20,7 @@ Setup:
 
 import argparse
 import os
+import re
 import sys
 import signal
 import textwrap
@@ -34,8 +35,15 @@ import sounddevice as sd
 import mlx_whisper
 import torch
 
+from rich.cells import cell_len
+from rich.console import Console
+from rich.live import Live
+from rich.text import Text
+
 from translator import Translator
 from deepl_translator import DeepLTranslator
+
+console = Console()
 
 # Try to import resemblyzer for speaker diarization
 try:
@@ -215,6 +223,7 @@ class LiveTranscriber:
         self.target_lang = target_lang
         self.last_speaker = None
         self.transcript_lines = []
+        self.recent_context = deque(maxlen=10)  # Rolling buffer for translation context
         self.model_repo = model_repo
         self.print_lock = threading.Lock()
         self.transcription_pool = ThreadPoolExecutor(max_workers=1)
@@ -378,6 +387,174 @@ class LiveTranscriber:
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+    def _get_col_widths(self):
+        """Calculate column widths for the two-column layout."""
+        tw = console.width
+        sep_len = 3  # " │ "
+        indent = 2
+        usable = tw - indent - sep_len
+        left_w = usable // 2
+        right_w = usable - left_w
+        return tw, indent, left_w, right_w
+
+    @staticmethod
+    def _wrap_display(text, width):
+        """Wrap text respecting display width (CJK chars count as 2)."""
+        if not text:
+            return [""]
+        words = text.split()
+        lines = []
+        line = ""
+        line_w = 0
+        for word in words:
+            w = cell_len(word)
+            if line:
+                if line_w + 1 + w <= width:
+                    line += " " + word
+                    line_w += 1 + w
+                else:
+                    lines.append(line)
+                    line = word
+                    line_w = w
+            else:
+                line = word
+                line_w = w
+        if line:
+            lines.append(line)
+        return lines or [""]
+
+    @staticmethod
+    def _pad_display(text, width):
+        """Pad text with spaces to reach target display width."""
+        pad = width - cell_len(text)
+        return text + " " * max(pad, 0)
+
+    def _render_columns(self, left_str, right_str, left_style="white", right_style="yellow"):
+        """Render two strings as side-by-side columns, wrapping as needed."""
+        _, indent, left_w, right_w = self._get_col_widths()
+
+        left_lines = self._wrap_display(left_str, left_w)
+        right_lines = self._wrap_display(right_str, right_w)
+        n = max(len(left_lines), len(right_lines))
+        left_lines += [""] * (n - len(left_lines))
+        right_lines += [""] * (n - len(right_lines))
+
+        result = Text()
+        for i, (l, r) in enumerate(zip(left_lines, right_lines)):
+            result.append(" " * indent)
+            result.append(self._pad_display(l, left_w), style=left_style)
+            result.append(" │ ", style="dim")
+            result.append(r, style=right_style)
+            if i < n - 1:
+                result.append("\n")
+        return result
+
+    def _print_fluid_columns(self, left_text, translation_future, lang_tag,
+                             delay=FLUID_WORD_DELAY):
+        """Print original (left) and translation (right) in columns with fluid animation.
+
+        The left column animates while the translation runs in the background.
+        Then the right column animates once the translation is ready.
+        Must be called while holding self.print_lock.
+        """
+        left_words = left_text.split()
+        final_left = f"{left_text} [{lang_tag}]"
+
+        with Live(self._render_columns("", ""),
+                  console=console, refresh_per_second=25,
+                  transient=False) as live:
+            # Phase 1: animate left column (translation runs in parallel)
+            built = ""
+            for word in left_words:
+                built += (" " if built else "") + word
+                live.update(self._render_columns(built, ""))
+                time.sleep(delay)
+            live.update(self._render_columns(final_left, "…"))
+
+            # Phase 2: grab translation result
+            translation = None
+            try:
+                translation = translation_future.result(timeout=10.0)
+            except Exception:
+                pass
+
+            if translation:
+                # Animate right column
+                right_words = translation.split()
+                built_r = ""
+                for word in right_words:
+                    built_r += (" " if built_r else "") + word
+                    live.update(self._render_columns(final_left, f"→ {built_r}"))
+                    time.sleep(delay)
+                live.update(self._render_columns(final_left, f"→ {translation}"))
+            else:
+                live.update(self._render_columns(final_left, ""))
+
+        return translation
+
+    @staticmethod
+    def _chunk_for_translation(text, max_chunk_len=120):
+        """Split text into sentence-level chunks for better translation quality.
+
+        Splits on sentence-ending punctuation first (. ! ? and CJK equivalents),
+        then falls back to clause boundaries (, ; :) if chunks are still too long.
+        """
+        # Split on sentence boundaries (keep the delimiter attached)
+        sentence_pattern = r'(?<=[.!?。？！\n])\s*'
+        sentences = re.split(sentence_pattern, text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        # If no sentence boundaries found, try clause boundaries
+        if len(sentences) == 1 and len(sentences[0]) > max_chunk_len:
+            clause_pattern = r'(?<=[,;:，；、])\s*'
+            sentences = re.split(clause_pattern, text)
+            sentences = [s.strip() for s in sentences if s.strip()]
+
+        # Merge very short adjacent chunks to avoid translating fragments
+        merged = []
+        buf = ""
+        for s in sentences:
+            if buf and len(buf) + len(s) + 1 <= max_chunk_len:
+                buf += " " + s
+            else:
+                if buf:
+                    merged.append(buf)
+                buf = s
+        if buf:
+            merged.append(buf)
+
+        return merged if merged else [text]
+
+    def _translate_chunked(self, text, source_lang):
+        """Translate text by chunking into sentences, passing recent context."""
+        context = list(self.recent_context) or None
+        chunks = self._chunk_for_translation(text)
+
+        if len(chunks) == 1:
+            return self.translator.translate(chunks[0], source_lang, context=context)
+
+        # Translate each chunk, first chunk gets the conversation context,
+        # subsequent chunks get context from prior chunks in this text
+        futures = []
+        for i, chunk in enumerate(chunks):
+            chunk_ctx = context if i == 0 else (context or []) + chunks[:i]
+            futures.append(
+                self.translation_pool.submit(
+                    self.translator.translate, chunk, source_lang, context=chunk_ctx
+                )
+            )
+
+        translated_parts = []
+        for future in futures:
+            try:
+                result = future.result(timeout=5.0)
+                translated_parts.append(result or "")
+            except Exception:
+                translated_parts.append("")
+
+        combined = " ".join(p for p in translated_parts if p)
+        return combined if combined else None
+
     def _transcribe_segment(self, audio_data):
         """Transcribe an audio segment with single-pass Whisper."""
         try:
@@ -424,14 +601,17 @@ class LiveTranscriber:
                 timestamp = datetime.now().strftime("%H:%M:%S")
 
                 if speaker != self.last_speaker:
-                    # New speaker - print header with separator line
-                    try:
-                        tw = os.get_terminal_size().columns
-                    except OSError:
-                        tw = 120
                     with self.print_lock:
-                        print(f"\n\033[0;90m{'─' * tw}\033[0m")
-                        print(f"\033[1;36m[{timestamp}] {speaker}:\033[0m")
+                        tw, indent, left_w, right_w = self._get_col_widths()
+                        console.print(f"\n[dim]{'─' * tw}[/dim]")
+                        console.print(f"[bold cyan][{timestamp}] {speaker}:[/bold cyan]")
+                        if self.translator:
+                            header = Text()
+                            header.append(" " * indent)
+                            header.append(self._pad_display("TRANSCRIPTION", left_w), style="dim bold")
+                            header.append(" │ ", style="dim")
+                            header.append("TRANSLATION", style="dim bold")
+                            console.print(header)
                     self.last_speaker = speaker
 
                 # Store transcript entry (translation filled async)
@@ -444,37 +624,28 @@ class LiveTranscriber:
                 }
                 self.transcript_lines.append(entry)
 
-                # Print original text with fluid word-by-word effect
                 if self.translator and lang in self.translate_langs:
-                    # Fire translation NOW so it runs during original text animation
+                    # Fire chunked translation NOW so it runs during left-column animation
                     future = self.translation_pool.submit(
-                        self.translator.translate, entry["text"], entry["language"]
+                        self._translate_chunked, entry["text"], entry["language"]
                     )
 
                     with self.print_lock:
-                        # Print original text
-                        self._print_fluid_line(
-                            f"{text} [{lang}]".split(),
-                            lambda b: f"  \033[0;37m{b}\033[0m",
+                        translation = self._print_fluid_columns(
+                            text, future, lang
                         )
-                        # Translation was running in parallel — grab result
-                        try:
-                            translation = future.result(timeout=5.0)
-                        except Exception:
-                            translation = None
                         if translation:
                             entry["translation"] = translation
-                            self._print_fluid_line(
-                                translation.split(),
-                                lambda b: f"  \033[0;33m→ {b}\033[0m",
-                            )
-                        print()
+
+                    # Update rolling context buffer for future translations
+                    self.recent_context.append(text)
                 else:
                     with self.print_lock:
                         self._print_fluid_line(
                             text.split(),
                             lambda b, lg=lang: f"  \033[0;37m{b}\033[0m  \033[0;90m[{lg}]\033[0m",
                         )
+                    self.recent_context.append(text)
 
         except Exception as e:
             print(f"\033[0;31m[Error] Transcription failed: {e}\033[0m")

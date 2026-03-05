@@ -46,8 +46,12 @@ class DeepLTranslator:
 
         self.client = deepl.Translator(api_key)
 
-    def translate(self, text, source_lang):
-        """Translate text to target language. Returns None if same language or on failure."""
+    def translate(self, text, source_lang, context=None):
+        """Translate text to target language. Returns None if same language or on failure.
+
+        If context is provided (list of recent lines), it is passed to DeepL's
+        native context parameter for better translation quality.
+        """
         if self.client is None:
             return None
         if source_lang == self.target_lang:
@@ -55,9 +59,10 @@ class DeepLTranslator:
         try:
             deepl_lang = self.LANG_MAP.get(source_lang, source_lang.upper())
             deepl_target = self.TARGET_LANG_MAP.get(self.target_lang, self.target_lang.upper())
-            result = self.client.translate_text(
-                text, source_lang=deepl_lang, target_lang=deepl_target
-            )
+            kwargs = dict(source_lang=deepl_lang, target_lang=deepl_target)
+            if context:
+                kwargs["context"] = "\n".join(context)
+            result = self.client.translate_text(text, **kwargs)
             return str(result) if result else None
         except Exception:
             return None
