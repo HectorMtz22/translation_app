@@ -36,6 +36,7 @@ import torch
 
 from display_columns import ColumnsDisplay
 from display_chat import ChatDisplay
+from summarizer import Summarizer
 from translator import Translator
 from deepl_translator import DeepLTranslator
 
@@ -51,10 +52,10 @@ except ImportError:
 
 SAMPLE_RATE = 16000          # Whisper expects 16kHz
 WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"  # GPU-accelerated MLX model
-SPEAKER_SIMILARITY = 0.82    # Cosine similarity threshold for same speaker
-NUM_SPEAKERS = 5             # Expected number of speakers (once reached, assigns to closest match)
-MAX_SPEAKERS = 5             # Maximum number of speakers to track
-MIN_CHUNKS_NEW_SPEAKER = 2   # Require N consecutive unmatched chunks before creating a new speaker
+SPEAKER_SIMILARITY = 0.72    # Cosine similarity threshold for same speaker (lower = more lenient matching)
+NUM_SPEAKERS = 2             # Expected number of speakers (once reached, assigns to closest match)
+MAX_SPEAKERS = 3             # Maximum number of speakers to track
+MIN_CHUNKS_NEW_SPEAKER = 4   # Require N consecutive unmatched chunks before creating a new speaker
 SUPPORTED_LANGUAGES = ["ko", "en", "es"]  # Korean, English, Spanish only
 LANG_NAMES = {"ko": "Korean", "en": "English", "es": "Spanish"}
 
@@ -66,7 +67,6 @@ MAX_SPEECH_DURATION = 5.0    # Force transcription after this much continuous sp
 SILENCE_AFTER_SPEECH = 0.5   # Pause duration to trigger end-of-speech (seconds)
 VAD_FRAME_SAMPLES = 512      # Silero VAD frame size (512 samples = 32ms at 16kHz)
 ENERGY_THRESHOLD = 0.002     # Minimum RMS energy to consider as real speech (not background noise)
-FLUID_WORD_DELAY = 0.04      # Seconds between words for fluid typewriter printing
 
 # ─── Global State ────────────────────────────────────────────────────────────
 
@@ -209,12 +209,14 @@ class LiveTranscriber:
     """Main live transcription engine with VAD-driven segmentation."""
 
     def __init__(self, device_index, translator=None, translate_langs=None,
-                 target_lang="en", model_repo=WHISPER_MODEL, display_mode="columns"):
+                 target_lang="en", model_repo=WHISPER_MODEL, display_mode="columns",
+                 summarizer=None):
         self.device_index = device_index
         self.speaker_tracker = SpeakerTracker()
         self.translator = translator
         self.translate_langs = translate_langs or set()
         self.target_lang = target_lang
+        self.summarizer = summarizer
         self.last_speaker = None
         self.transcript_lines = []
         self.recent_context = deque(maxlen=10)  # Rolling buffer for translation context
@@ -419,34 +421,37 @@ class LiveTranscriber:
 
             lang = result.get("language", "??")
             if lang not in SUPPORTED_LANGUAGES:
-                # Whisper detected an unsupported language — likely misdetection,
-                # discard the entire result since the transcription itself is wrong
                 return
 
+            # Collect all valid segments and group by speaker
+            groups = []  # list of (speaker, [text, ...])
             for segment in result["segments"]:
                 text = segment["text"].strip()
                 if not text or len(text) < 2:
                     continue
 
-                # Filter low-confidence segments using per-segment metrics
                 avg_logprob = segment.get("avg_logprob", 0)
                 no_speech_prob = segment.get("no_speech_prob", 0)
                 if avg_logprob < -1.0 or no_speech_prob > 0.7:
                     continue
 
-                # Filter out Whisper hallucinations
                 if self._is_hallucination(text):
                     continue
 
-                # Get the audio portion for this segment for speaker ID
                 start_sample = int(segment["start"] * SAMPLE_RATE)
                 end_sample = min(int(segment["end"] * SAMPLE_RATE), len(audio_data))
                 segment_audio = audio_data[start_sample:end_sample]
-
-                # Identify speaker
                 speaker = self.speaker_tracker.identify_speaker(segment_audio)
 
-                # Format and print
+                # Append to current group or start a new one
+                if groups and groups[-1][0] == speaker:
+                    groups[-1][1].append(text)
+                else:
+                    groups.append((speaker, [text]))
+
+            # Display one message per speaker group
+            for speaker, texts in groups:
+                full_text = " ".join(texts)
                 timestamp = datetime.now().strftime("%H:%M:%S")
 
                 with self.print_lock:
@@ -455,46 +460,57 @@ class LiveTranscriber:
                     )
                 self.last_speaker = speaker
 
-                # Store transcript entry (translation filled async)
                 entry = {
                     "time": timestamp,
                     "speaker": speaker,
-                    "text": text,
+                    "text": full_text,
                     "language": lang,
                     "translation": None,
                 }
                 self.transcript_lines.append(entry)
 
+                if self.summarizer:
+                    self.summarizer.add_line(speaker, full_text, lang)
+
                 if self.translator and lang in self.translate_langs:
-                    # Split into chunks and translate/display each one
                     context = list(self.recent_context) or None
-                    chunks = self._chunk_for_translation(entry["text"])
+                    chunks = self._chunk_for_translation(full_text)
+
+                    # Translate all chunks, then display as one message
+                    futures = []
+                    for i, chunk_text in enumerate(chunks):
+                        chunk_ctx = context if i == 0 else (context or []) + chunks[:i]
+                        futures.append(self.translation_pool.submit(
+                            self.translator.translate, chunk_text,
+                            entry["language"], context=chunk_ctx
+                        ))
+
+                    # Collect all translations
+                    all_translations = []
+                    for future in futures:
+                        try:
+                            t = future.result(timeout=10.0)
+                            if t:
+                                all_translations.append(t)
+                        except Exception:
+                            pass
+
+                    full_translation = " ".join(all_translations) if all_translations else None
+                    entry["translation"] = full_translation
 
                     with self.print_lock:
-                        all_translations = []
-                        for i, chunk_text in enumerate(chunks):
-                            chunk_ctx = context if i == 0 else (context or []) + chunks[:i]
-                            future = self.translation_pool.submit(
-                                self.translator.translate, chunk_text,
-                                entry["language"], context=chunk_ctx
-                            )
-                            translation = self.display.print_with_translation(
-                                speaker, chunk_text, future, lang,
-                                timestamp=timestamp
-                            )
-                            if translation:
-                                all_translations.append(translation)
-                        if all_translations:
-                            entry["translation"] = " ".join(all_translations)
+                        self.display.print_translated(
+                            speaker, full_text, full_translation, lang,
+                            timestamp=timestamp
+                        )
 
-                    # Update rolling context buffer for future translations
-                    self.recent_context.append(text)
+                    self.recent_context.append(full_text)
                 else:
                     with self.print_lock:
                         self.display.print_without_translation(
-                            speaker, text, lang, timestamp=timestamp
+                            speaker, full_text, lang, timestamp=timestamp
                         )
-                    self.recent_context.append(text)
+                    self.recent_context.append(full_text)
 
         except Exception as e:
             print(f"\033[0;31m[Error] Transcription failed: {e}\033[0m")
@@ -554,6 +570,7 @@ class LiveTranscriber:
         print(f"  Max speech segment: {MAX_SPEECH_DURATION}s")
         print(f"  Speaker diarization: {'ON' if DIARIZATION_AVAILABLE else 'OFF'}")
         print(f"  Display mode: {self.display.__class__.__name__}")
+        print(f"  Live summary: {'ON' if self.summarizer else 'OFF'}")
         if self.translator:
             from_list = ", ".join(
                 f"{LANG_NAMES.get(l, l)} ({l})" for l in sorted(self.translate_langs)
@@ -592,6 +609,8 @@ class LiveTranscriber:
         try:
             stream.start()
             process_thread.start()
+            if self.summarizer:
+                self.summarizer.start()
 
             while running:
                 time.sleep(0.1)
@@ -604,6 +623,14 @@ class LiveTranscriber:
             self.transcription_pool.shutdown(wait=True, cancel_futures=False)
             if self.translation_pool:
                 self.translation_pool.shutdown(wait=True, cancel_futures=False)
+            if self.summarizer:
+                final_summary = self.summarizer.stop()
+                if final_summary:
+                    print(f"\n{'=' * 60}")
+                    print("  FINAL SUMMARY")
+                    print(f"{'=' * 60}")
+                    print(f"  {final_summary}")
+                    print(f"{'=' * 60}")
             self.save_transcript()
             print("Done.")
 
@@ -620,6 +647,8 @@ def main():
                         help="Target language code (default: en)")
     parser.add_argument("--display", choices=["columns", "chat"], default=None,
                         help="Display mode: columns (side-by-side) or chat (bubble UI)")
+    parser.add_argument("--summary", choices=["on", "off"], default=None,
+                        help="Enable live rolling summary via local LLM")
     args = parser.parse_args()
 
     print("\n\033[1mLive Transcribe - System Audio\033[0m\n")
@@ -749,11 +778,37 @@ def main():
             display_mode = "columns"
     print(f"Using display: {display_mode}")
 
+    # Select summary mode
+    summarizer = None
+    if args.summary is not None:
+        enable_summary = args.summary == "on"
+    else:
+        print("\nLive summary (local LLM):")
+        print("-" * 40)
+        print("  [1] Off")
+        print("  [2] On (rolling summary via Qwen 7B)")
+        print()
+        try:
+            s_choice = input("Select [Enter=1]: ").strip()
+            enable_summary = s_choice == "2"
+        except (ValueError, EOFError):
+            enable_summary = False
+
+    if enable_summary:
+        def on_summary(text):
+            print(f"\n\033[1;35m{'─' * 40}")
+            print(f"  SUMMARY")
+            print(f"{'─' * 40}\033[0m")
+            print(f"\033[0;35m  {text}\033[0m")
+            print(f"\033[1;35m{'─' * 40}\033[0m\n")
+
+        summarizer = Summarizer(target_lang=target_lang, on_summary=on_summary)
+
     # Start transcription
     transcriber = LiveTranscriber(
         device_idx, translator=translator,
         translate_langs=translate_langs, target_lang=target_lang,
-        display_mode=display_mode,
+        display_mode=display_mode, summarizer=summarizer,
     )
     transcriber.start()
 

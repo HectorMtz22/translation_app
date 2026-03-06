@@ -1,16 +1,11 @@
 """Chat bubble display mode: messages appear as aligned chat bubbles per speaker."""
 
-import time
-
 from rich.align import Align
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
 console = Console()
-
-FLUID_WORD_DELAY = 0.04
 
 SPEAKER_COLORS = ["cyan", "green", "magenta", "yellow", "blue"]
 
@@ -28,37 +23,15 @@ class ChatDisplay:
         """No-op for chat mode — speaker info is shown in the bubble title."""
         pass
 
-    def print_with_translation(self, speaker, text, translation_future, lang_tag,
-                               timestamp=None, delay=FLUID_WORD_DELAY):
-        """Print a chat bubble with fluid animation for translation only."""
-        with Live(self._render_bubble(speaker, text, translation="…",
-                                      lang_tag=lang_tag, timestamp=timestamp),
-                  console=console, refresh_per_second=25,
-                  transient=False) as live:
-            translation = None
-            try:
-                translation = translation_future.result(timeout=10.0)
-            except Exception:
-                pass
-
-            if translation:
-                right_words = translation.split()
-                built_r = ""
-                for word in right_words:
-                    built_r += (" " if built_r else "") + word
-                    live.update(self._render_bubble(speaker, text, translation=f"→ {built_r}",
-                                                   lang_tag=lang_tag, timestamp=timestamp))
-                    time.sleep(delay)
-                live.update(self._render_bubble(speaker, text, translation=f"→ {translation}",
-                                               lang_tag=lang_tag, timestamp=timestamp))
-            else:
-                live.update(self._render_bubble(speaker, text, lang_tag=lang_tag,
-                                               timestamp=timestamp))
-
-        return translation
+    def print_translated(self, speaker, text, translation, lang_tag,
+                         timestamp=None):
+        """Print a chat bubble with original text and translation."""
+        t = f"→ {translation}" if translation else None
+        console.print(self._render_bubble(speaker, text, translation=t,
+                                          lang_tag=lang_tag, timestamp=timestamp))
 
     def print_without_translation(self, speaker, text, lang_tag,
-                                  timestamp=None, delay=FLUID_WORD_DELAY):
+                                  timestamp=None):
         """Print a chat bubble instantly (no translation)."""
         console.print(self._render_bubble(speaker, text, lang_tag=lang_tag,
                                           timestamp=timestamp))

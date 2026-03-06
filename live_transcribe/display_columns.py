@@ -1,15 +1,10 @@
 """Column-based display mode: side-by-side transcription and translation."""
 
-import time
-
 from rich.cells import cell_len
 from rich.console import Console
-from rich.live import Live
 from rich.text import Text
 
 console = Console()
-
-FLUID_WORD_DELAY = 0.04
 
 
 class ColumnsDisplay:
@@ -35,35 +30,15 @@ class ColumnsDisplay:
             header.append("TRANSLATION", style="dim bold")
             console.print(header)
 
-    def print_with_translation(self, speaker, text, translation_future, lang_tag,
-                               timestamp=None, delay=FLUID_WORD_DELAY):
-        """Print original (left) and translation (right) with fluid animation on translation only."""
+    def print_translated(self, speaker, text, translation, lang_tag,
+                         timestamp=None):
+        """Print original (left) and translation (right) instantly."""
         final_left = f"{text} [{lang_tag}]"
-
-        with Live(self._render_columns(final_left, "…"),
-                  console=console, refresh_per_second=25,
-                  transient=False) as live:
-            translation = None
-            try:
-                translation = translation_future.result(timeout=10.0)
-            except Exception:
-                pass
-
-            if translation:
-                right_words = translation.split()
-                built_r = ""
-                for word in right_words:
-                    built_r += (" " if built_r else "") + word
-                    live.update(self._render_columns(final_left, f"→ {built_r}"))
-                    time.sleep(delay)
-                live.update(self._render_columns(final_left, f"→ {translation}"))
-            else:
-                live.update(self._render_columns(final_left, ""))
-
-        return translation
+        right = f"→ {translation}" if translation else ""
+        console.print(self._render_columns(final_left, right))
 
     def print_without_translation(self, speaker, text, lang_tag,
-                                  timestamp=None, delay=FLUID_WORD_DELAY):
+                                  timestamp=None):
         """Print text instantly (no translation)."""
         console.print(f"  [white]{text}[/white]  [dim][{lang_tag}][/dim]")
 
