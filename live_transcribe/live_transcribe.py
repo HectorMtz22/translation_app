@@ -51,7 +51,7 @@ except ImportError:
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000          # Whisper expects 16kHz
-WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"  # GPU-accelerated MLX model
+WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx-4bit"  # Q4 quantized; 3x smaller, retains all 32 decoder layers
 SPEAKER_SIMILARITY = 0.72    # Cosine similarity threshold for same speaker (lower = more lenient matching)
 NUM_SPEAKERS = 2             # Expected number of speakers (once reached, assigns to closest match)
 MAX_SPEAKERS = 3             # Maximum number of speakers to track
