@@ -20,6 +20,9 @@ Setup:
 
 import argparse
 import os
+
+os.environ["PYTHONWARNINGS"] = "ignore::UserWarning:multiprocessing.resource_tracker"
+
 import re
 import sys
 import signal
@@ -30,13 +33,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import numpy as np
+from scipy.signal import butter, sosfilt
 import sounddevice as sd
 import mlx_whisper
 import torch
 
 from display_columns import ColumnsDisplay
 from display_chat import ChatDisplay
-from summarizer import Summarizer
+from summarizer import SummarizerProcess
 from translator import Translator
 from deepl_translator import DeepLTranslator
 
@@ -67,6 +71,27 @@ MAX_SPEECH_DURATION = 5.0    # Force transcription after this much continuous sp
 SILENCE_AFTER_SPEECH = 0.5   # Pause duration to trigger end-of-speech (seconds)
 VAD_FRAME_SAMPLES = 512      # Silero VAD frame size (512 samples = 32ms at 16kHz)
 ENERGY_THRESHOLD = 0.002     # Minimum RMS energy to consider as real speech (not background noise)
+SPEECH_PAD_SAMPLES = int(SAMPLE_RATE * 0.15)  # 150ms padding before/after speech for cleaner word boundaries
+
+# ─── Whisper Prompt Hints ────────────────────────────────────────────────────
+# Initial prompts per language reduce hallucinations and guide punctuation style
+INITIAL_PROMPTS = {
+    "ko": "안녕하세요. 네, 알겠습니다. 감사합니다.",
+    "en": "Hello. Yes, I understand. Thank you.",
+    "es": "Hola. Sí, entiendo. Gracias.",
+}
+
+# Common Whisper hallucination phrases (produced from silence/noise)
+HALLUCINATION_PHRASES = {
+    "thank you", "thanks for watching", "thanks for listening",
+    "subscribe", "like and subscribe", "see you next time",
+    "bye", "goodbye", "thank you for watching",
+    "please subscribe", "the end", "you",
+    "시청해 주셔서 감사합니다", "구독", "좋아요",
+    "감사합니다", "고마워요",
+    "gracias por ver", "suscríbete",
+    "MBC 뉴스", "KBS 뉴스",
+}
 
 # ─── Global State ────────────────────────────────────────────────────────────
 
@@ -231,6 +256,15 @@ class LiveTranscriber:
         else:
             self.display = ColumnsDisplay()
 
+        # Audio preprocessing: high-pass filter at 80Hz to remove rumble/hum
+        self._hp_sos = butter(5, 80, btype='high', fs=SAMPLE_RATE, output='sos')
+
+        # Duplicate suppression: track recent transcriptions
+        self._recent_texts = deque(maxlen=5)
+
+        # Track detected language for initial_prompt hinting
+        self._detected_lang = None
+
         # VAD state
         self.vad_model = load_vad_model()
         self.audio_queue = deque()  # Raw audio frames waiting for VAD processing
@@ -338,19 +372,43 @@ class LiveTranscriber:
         if rms < ENERGY_THRESHOLD:
             return
 
+        # Audio preprocessing pipeline
+        audio_data = self._preprocess_audio(audio_data)
+
         self.transcription_pool.submit(self._transcribe_segment, audio_data)
+
+    def _preprocess_audio(self, audio):
+        """Apply high-pass filter and peak normalization for cleaner transcription."""
+        # High-pass filter: remove low-frequency rumble/hum (< 80Hz)
+        audio = sosfilt(self._hp_sos, audio).astype(np.float32)
+
+        # Add small silence padding at boundaries so Whisper doesn't clip words
+        pad = np.zeros(SPEECH_PAD_SAMPLES, dtype=np.float32)
+        audio = np.concatenate([pad, audio, pad])
+
+        # Peak normalization to -1dB to maximize SNR without clipping
+        peak = np.max(np.abs(audio))
+        if peak > 0:
+            audio = audio * (0.9 / peak)
+
+        return audio
 
     @staticmethod
     def _is_hallucination(text):
-        """Detect Whisper hallucination patterns (repetitive tokens or phrases)."""
+        """Detect Whisper hallucination patterns (repetitive tokens or known phantom phrases)."""
         stripped = text.strip()
         if not stripped:
             return True
+
+        # Check against known hallucination phrases (Whisper commonly produces these from silence)
+        normalized = stripped.lower().strip(" .!?,。？！")
+        if normalized in HALLUCINATION_PHRASES:
+            return True
+
         # Split into words/tokens
         tokens = stripped.split()
         if len(tokens) < 3:
             # For very short text, check if it's just repeated characters
-            # e.g. "와와" or "aaaa"
             unique_chars = set(stripped.replace(" ", ""))
             if len(unique_chars) <= 2 and len(stripped) > 1:
                 return True
@@ -370,6 +428,21 @@ class LiveTranscriber:
             ngram_counts = Counter(ngrams)
             most_common_ngram, mc_count = ngram_counts.most_common(1)[0]
             if mc_count >= 3 and (mc_count * len(most_common_ngram)) / len(tokens) > 0.5:
+                return True
+        return False
+
+    def _is_duplicate(self, text):
+        """Check if text is a near-duplicate of a recent transcription."""
+        normalized = text.strip().lower()
+        for recent in self._recent_texts:
+            if not recent:
+                continue
+            # Exact match
+            if normalized == recent:
+                return True
+            # Substring containment (one contains 80%+ of the other)
+            shorter, longer = sorted([normalized, recent], key=len)
+            if len(shorter) > 5 and shorter in longer:
                 return True
         return False
 
@@ -409,19 +482,26 @@ class LiveTranscriber:
     def _transcribe_segment(self, audio_data):
         """Transcribe an audio segment with single-pass Whisper."""
         try:
+            # Use language-specific initial prompt to guide punctuation and reduce hallucinations
+            initial_prompt = INITIAL_PROMPTS.get(self._detected_lang)
+
             result = mlx_whisper.transcribe(
                 audio_data,
                 path_or_hf_repo=self.model_repo,
-                temperature=(0.0, 0.4),
+                initial_prompt=initial_prompt,
+                temperature=(0.0, 0.2, 0.4),
                 condition_on_previous_text=False,
                 compression_ratio_threshold=1.8,
                 logprob_threshold=-1.0,
-                no_speech_threshold=0.8,
+                no_speech_threshold=0.6,
             )
 
             lang = result.get("language", "??")
             if lang not in SUPPORTED_LANGUAGES:
                 return
+
+            # Update detected language for next segment's initial_prompt
+            self._detected_lang = lang
 
             # Collect all valid segments and group by speaker
             groups = []  # list of (speaker, [text, ...])
@@ -432,7 +512,7 @@ class LiveTranscriber:
 
                 avg_logprob = segment.get("avg_logprob", 0)
                 no_speech_prob = segment.get("no_speech_prob", 0)
-                if avg_logprob < -1.0 or no_speech_prob > 0.7:
+                if avg_logprob < -1.0 or no_speech_prob > 0.6:
                     continue
 
                 if self._is_hallucination(text):
@@ -452,6 +532,12 @@ class LiveTranscriber:
             # Display one message per speaker group
             for speaker, texts in groups:
                 full_text = " ".join(texts)
+
+                # Skip near-duplicate transcriptions (Whisper sometimes repeats itself)
+                if self._is_duplicate(full_text):
+                    continue
+                self._recent_texts.append(full_text.strip().lower())
+
                 timestamp = datetime.now().strftime("%H:%M:%S")
 
                 with self.print_lock:
@@ -802,7 +888,7 @@ def main():
             print(f"\033[0;35m  {text}\033[0m")
             print(f"\033[1;35m{'─' * 40}\033[0m\n")
 
-        summarizer = Summarizer(target_lang=target_lang, on_summary=on_summary)
+        summarizer = SummarizerProcess(target_lang=target_lang, on_summary=on_summary)
 
     # Start transcription
     transcriber = LiveTranscriber(
