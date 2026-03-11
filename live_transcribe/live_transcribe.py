@@ -76,7 +76,7 @@ SPEECH_PAD_SAMPLES = int(SAMPLE_RATE * 0.15)  # 150ms padding before/after speec
 # ─── Whisper Prompt Hints ────────────────────────────────────────────────────
 # Initial prompts per language reduce hallucinations and guide punctuation style
 INITIAL_PROMPTS = {
-    "ko": "안녕하세요. 네, 알겠습니다. 감사합니다.",
+    "ko": "안녕하세요. 네, 알겠습니다. 그래서 이제 어떻게 할까요? 아, 그렇구나. 잠깐만요, 다시 한번 말씀해 주세요. 좋습니다, 진행하겠습니다.",
     "en": "Hello. Yes, I understand. Thank you.",
     "es": "Hola. Sí, entiendo. Gracias.",
 }
@@ -89,6 +89,12 @@ HALLUCINATION_PHRASES = {
     "please subscribe", "the end", "you",
     "시청해 주셔서 감사합니다", "구독", "좋아요",
     "감사합니다", "고마워요",
+    "다음 시간에 만나요", "구독과 좋아요",
+    "좋아요와 구독", "채널에 가입", "알림 설정",
+    "영상 시청해 주셔서 감사합니다",
+    "오늘도 시청해 주셔서 감사합니다",
+    "끝까지 시청해 주셔서 감사합니다",
+    "SBS 뉴스", "YTN 뉴스", "JTBC 뉴스", "채널A 뉴스",
     "gracias por ver", "suscríbete",
     "MBC 뉴스", "KBS 뉴스",
 }
@@ -405,13 +411,23 @@ class LiveTranscriber:
         if normalized in HALLUCINATION_PHRASES:
             return True
 
+        # Korean-specific: detect repeated syllable/character patterns (Korean has fewer spaces)
+        no_spaces = stripped.replace(" ", "")
+        if len(no_spaces) >= 4:
+            # Check for single character repetition (e.g. "아아아아아")
+            unique_chars = set(no_spaces)
+            if len(unique_chars) <= 2:
+                return True
+            # Check for repeating character n-grams (e.g. "하하하하" or "네네네네")
+            for n in range(1, min(len(no_spaces) // 3 + 1, 6)):
+                pattern = no_spaces[:n]
+                repetitions = no_spaces.count(pattern)
+                if repetitions >= 3 and (repetitions * n) / len(no_spaces) > 0.6:
+                    return True
+
         # Split into words/tokens
         tokens = stripped.split()
         if len(tokens) < 3:
-            # For very short text, check if it's just repeated characters
-            unique_chars = set(stripped.replace(" ", ""))
-            if len(unique_chars) <= 2 and len(stripped) > 1:
-                return True
             return False
         # Check if most tokens are the same (repetitive hallucination)
         unique_tokens = set(tokens)
