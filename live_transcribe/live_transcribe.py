@@ -43,6 +43,7 @@ from display_chat import ChatDisplay
 from summarizer import SummarizerProcess
 from translator import Translator
 from deepl_translator import DeepLTranslator
+from qwen_translator import QwenTranslator
 
 # Try to import resemblyzer for speaker diarization
 try:
@@ -741,7 +742,7 @@ def main():
     parser = argparse.ArgumentParser(description="Live system audio transcription with speaker diarization")
     parser.add_argument("-d", "--device", type=int, default=None,
                         help="Input device index (skip interactive prompt)")
-    parser.add_argument("-t", "--translator", choices=["google", "deepl", "none"], default=None,
+    parser.add_argument("-t", "--translator", choices=["google", "deepl", "qwen", "none"], default=None,
                         help="Translation service: google, deepl, or none to disable")
     parser.add_argument("--translate-from", default=None,
                         help="Comma-separated source language codes to translate (default: ko)")
@@ -786,13 +787,16 @@ def main():
         print("-" * 40)
         print("  [1] Google Translate")
         print("  [2] DeepL")
-        print("  [3] None (transcription only)")
+        print("  [3] Qwen (local LLM, offline)")
+        print("  [4] None (transcription only)")
         print()
         try:
             t_choice = input("Select translation service [Enter=1]: ").strip()
             if t_choice == "2":
                 translator_choice = "deepl"
             elif t_choice == "3":
+                translator_choice = "qwen"
+            elif t_choice == "4":
                 translator_choice = "none"
             else:
                 translator_choice = "google"
@@ -860,6 +864,9 @@ def main():
         if translator_choice == "deepl":
             translator = DeepLTranslator(target_lang=target_lang)
             print(f"Using translator: DeepL")
+        elif translator_choice == "qwen":
+            translator = QwenTranslator(target_lang=target_lang)
+            print(f"Using translator: Qwen (local LLM)")
         else:
             translator = Translator(target_lang=target_lang)
             print(f"Using translator: Google Translate")
