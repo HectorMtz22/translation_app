@@ -251,11 +251,14 @@ class LiveTranscriber:
         self.summarizer = summarizer
         self.last_speaker = None
         self.transcript_lines = []
-        self.recent_context = deque(maxlen=10)  # Rolling buffer for translation context
+        self.recent_context = deque(maxlen=10)  # Rolling buffer: (original, translation) pairs
         self.model_repo = model_repo
         self.print_lock = threading.Lock()
+        self.gpu_lock = threading.Lock()  # Serialize Metal/MLX operations (Whisper + Qwen)
         self.transcription_pool = ThreadPoolExecutor(max_workers=1)
-        self.translation_pool = ThreadPoolExecutor(max_workers=4) if translator else None
+        # Qwen serializes on GPU anyway, so 1 worker suffices; others can parallelize
+        translation_workers = 1 if isinstance(translator, QwenTranslator) else 4
+        self.translation_pool = ThreadPoolExecutor(max_workers=translation_workers) if translator else None
 
         # Display mode
         if display_mode == "chat":
@@ -496,22 +499,65 @@ class LiveTranscriber:
 
         return merged if merged else [text]
 
+    def _retranslate_recent(self, source_lang):
+        """Re-translate recent entries with updated context (Qwen only).
+
+        If context causes a previous translation to change, update the display.
+        """
+        # Gather candidates: recent translated entries excluding the last one (just added)
+        candidates = []
+        for i, entry in enumerate(self.transcript_lines):
+            if entry.get("translation") and entry["language"] == source_lang:
+                candidates.append((i, entry))
+        # Only re-translate the last 3 entries before the current one
+        candidates = candidates[-4:-1]
+        if not candidates:
+            return
+
+        context = list(self.recent_context)
+
+        for idx, entry in candidates:
+            try:
+                new_translation = self.translator.translate(
+                    entry["text"], entry["language"], context=context
+                )
+            except Exception:
+                continue
+
+            if new_translation and new_translation != entry["translation"]:
+                old_translation = entry["translation"]
+                entry["translation"] = new_translation
+
+                # Update recent_context deque
+                for j, (orig, trans) in enumerate(self.recent_context):
+                    if orig == entry["text"] and trans == old_translation:
+                        self.recent_context[j] = (orig, new_translation)
+                        break
+
+                with self.print_lock:
+                    self.display.update_translation(
+                        entry.get("_display_key"), entry["speaker"],
+                        entry["text"], new_translation,
+                        entry["language"], timestamp=entry["time"],
+                    )
+
     def _transcribe_segment(self, audio_data):
         """Transcribe an audio segment with single-pass Whisper."""
         try:
             # Use language-specific initial prompt to guide punctuation and reduce hallucinations
             initial_prompt = INITIAL_PROMPTS.get(self._detected_lang)
 
-            result = mlx_whisper.transcribe(
-                audio_data,
-                path_or_hf_repo=self.model_repo,
-                initial_prompt=initial_prompt,
-                temperature=(0.0, 0.2, 0.4),
-                condition_on_previous_text=False,
-                compression_ratio_threshold=1.8,
-                logprob_threshold=-1.0,
-                no_speech_threshold=0.6,
-            )
+            with self.gpu_lock:
+                result = mlx_whisper.transcribe(
+                    audio_data,
+                    path_or_hf_repo=self.model_repo,
+                    initial_prompt=initial_prompt,
+                    temperature=(0.0, 0.2, 0.4),
+                    condition_on_previous_text=False,
+                    compression_ratio_threshold=1.8,
+                    logprob_threshold=-1.0,
+                    no_speech_threshold=0.6,
+                )
 
             lang = result.get("language", "??")
             if lang not in SUPPORTED_LANGUAGES:
@@ -557,12 +603,6 @@ class LiveTranscriber:
 
                 timestamp = datetime.now().strftime("%H:%M:%S")
 
-                with self.print_lock:
-                    self.display.print_segment_header(
-                        speaker, timestamp, has_translator=bool(self.translator)
-                    )
-                self.last_speaker = speaker
-
                 entry = {
                     "time": timestamp,
                     "speaker": speaker,
@@ -570,50 +610,74 @@ class LiveTranscriber:
                     "language": lang,
                     "translation": None,
                 }
+                entry_key = id(entry)
+                entry["_display_key"] = entry_key
                 self.transcript_lines.append(entry)
+
+                with self.print_lock:
+                    self.display.print_segment_header(
+                        speaker, timestamp, has_translator=bool(self.translator),
+                        entry_key=entry_key,
+                    )
+                self.last_speaker = speaker
 
                 if self.summarizer:
                     self.summarizer.add_line(speaker, full_text, lang)
 
                 if self.translator and lang in self.translate_langs:
                     context = list(self.recent_context) or None
-                    chunks = self._chunk_for_translation(full_text)
 
-                    # Translate all chunks, then display as one message
-                    futures = []
-                    for i, chunk_text in enumerate(chunks):
-                        chunk_ctx = context if i == 0 else (context or []) + chunks[:i]
-                        futures.append(self.translation_pool.submit(
-                            self.translator.translate, chunk_text,
-                            entry["language"], context=chunk_ctx
-                        ))
+                    if isinstance(self.translator, QwenTranslator):
+                        # Qwen: translate full text as a whole, no chunking
+                        full_translation = self.translator.translate(
+                            full_text, entry["language"], context=context
+                        )
+                    else:
+                        chunks = self._chunk_for_translation(full_text)
 
-                    # Collect all translations
-                    all_translations = []
-                    for future in futures:
-                        try:
-                            t = future.result(timeout=10.0)
-                            if t:
-                                all_translations.append(t)
-                        except Exception:
-                            pass
+                        # Translate all chunks, then display as one message
+                        futures = []
+                        for i, chunk_text in enumerate(chunks):
+                            chunk_ctx = context if i == 0 else (context or []) + [(c, None) for c in chunks[:i]]
+                            futures.append(self.translation_pool.submit(
+                                self.translator.translate, chunk_text,
+                                entry["language"], context=chunk_ctx
+                            ))
 
-                    full_translation = " ".join(all_translations) if all_translations else None
+                        # Collect all translations
+                        all_translations = []
+                        for future in futures:
+                            try:
+                                t = future.result(timeout=10.0)
+                                if t:
+                                    all_translations.append(t)
+                            except Exception:
+                                pass
+
+                        full_translation = " ".join(all_translations) if all_translations else None
+
                     entry["translation"] = full_translation
 
                     with self.print_lock:
                         self.display.print_translated(
                             speaker, full_text, full_translation, lang,
-                            timestamp=timestamp
+                            timestamp=timestamp, entry_key=entry_key,
                         )
 
-                    self.recent_context.append(full_text)
+                    self.recent_context.append((full_text, full_translation))
+
+                    # Qwen: re-translate recent entries with updated context
+                    if isinstance(self.translator, QwenTranslator):
+                        self.translation_pool.submit(
+                            self._retranslate_recent, entry["language"]
+                        )
                 else:
                     with self.print_lock:
                         self.display.print_without_translation(
-                            speaker, full_text, lang, timestamp=timestamp
+                            speaker, full_text, lang, timestamp=timestamp,
+                            entry_key=entry_key,
                         )
-                    self.recent_context.append(full_text)
+                    self.recent_context.append((full_text, None))
 
         except Exception as e:
             print(f"\033[0;31m[Error] Transcription failed: {e}\033[0m")
@@ -712,6 +776,7 @@ class LiveTranscriber:
         try:
             stream.start()
             process_thread.start()
+            self.display.start()
             if self.summarizer:
                 self.summarizer.start()
 
@@ -719,6 +784,7 @@ class LiveTranscriber:
                 time.sleep(0.1)
 
         finally:
+            self.display.stop()
             stream.stop()
             stream.close()
             running = False
@@ -919,6 +985,11 @@ def main():
         translate_langs=translate_langs, target_lang=target_lang,
         display_mode=display_mode, summarizer=summarizer,
     )
+
+    # Share the GPU lock with Qwen so Whisper and Qwen don't collide on Metal
+    if isinstance(translator, QwenTranslator):
+        translator._gpu_lock = transcriber.gpu_lock
+
     transcriber.start()
 
 

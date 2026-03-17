@@ -90,6 +90,8 @@ class DeepLTranslator:
                 if context:
                     # Limit context to last 5 lines for API efficiency
                     recent_ctx = context[-5:] if len(context) > 5 else context
+                    # Extract original text from (original, translation) tuples
+                    recent_ctx = [c[0] if isinstance(c, tuple) else c for c in recent_ctx]
                     kwargs["context"] = "\n".join(recent_ctx)
                 result = self.client.translate_text(text, **kwargs)
                 translated = str(result) if result else None

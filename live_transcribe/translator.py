@@ -73,6 +73,8 @@ class Translator:
                     marker = "|||"
                     # Limit context to last 5 lines to avoid exceeding API limits
                     recent_ctx = context[-5:] if len(context) > 5 else context
+                    # Extract original text from (original, translation) tuples
+                    recent_ctx = [c[0] if isinstance(c, tuple) else c for c in recent_ctx]
                     block = "\n".join(recent_ctx) + f"\n{marker}\n" + text
                     result = translator.translate(block)
                     if result and marker in result:

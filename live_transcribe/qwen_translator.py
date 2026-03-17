@@ -17,10 +17,11 @@ LANG_NAMES = {
 class QwenTranslator:
     """Translates text using a local Qwen LLM with caching."""
 
-    def __init__(self, target_lang="en", model_repo=QWEN_MODEL):
+    def __init__(self, target_lang="en", model_repo=QWEN_MODEL, gpu_lock=None):
         self.target_lang = target_lang
         self._cache = OrderedDict()
         self._lock = threading.Lock()
+        self._gpu_lock = gpu_lock  # Shared lock to serialize Metal/MLX ops with Whisper
 
         try:
             from mlx_lm import load
@@ -52,8 +53,9 @@ class QwenTranslator:
     def translate(self, text, source_lang, context=None):
         """Translate text to target language. Returns None if same language or on failure.
 
-        If context is provided (list of recent lines), it is included in the
-        prompt to improve translation quality.
+        Context is a list of (original, translation) tuples from previous lines.
+        Both original and translated text are included so the model can maintain
+        consistency and improve upon previous translations.
         Uses LRU cache to avoid re-translating identical text.
         """
         if not self._available:
@@ -74,14 +76,27 @@ class QwenTranslator:
 
             prompt_parts = [
                 f"Translate the following {src_name} text to {tgt_name}.",
+                "Use the conversation context below to maintain consistency in terminology, "
+                "names, and meaning. If previous translations have errors based on new context, "
+                "translate the current text correctly using the improved understanding.",
                 "Output ONLY the translation, nothing else.",
             ]
 
             if context:
-                recent_ctx = context[-5:] if len(context) > 5 else context
+                ctx_lines = []
+                for item in context:
+                    if isinstance(item, tuple):
+                        orig, trans = item
+                        if trans:
+                            ctx_lines.append(f"  {src_name}: {orig}\n  {tgt_name}: {trans}")
+                        else:
+                            ctx_lines.append(f"  {src_name}: {orig}")
+                    else:
+                        # Backward compat: plain string context
+                        ctx_lines.append(f"  {src_name}: {item}")
                 prompt_parts.append(
-                    f"\nContext (previous lines for reference, do NOT translate these):\n"
-                    + "\n".join(recent_ctx)
+                    f"\nConversation so far (for reference, do NOT translate these):\n"
+                    + "\n".join(ctx_lines)
                 )
 
             prompt_parts.append(f"\nText to translate:\n{text}")
@@ -91,7 +106,8 @@ class QwenTranslator:
                 messages, tokenize=False, add_generation_prompt=True
             )
 
-            with self._lock:
+            lock = self._gpu_lock or self._lock
+            with lock:
                 result = generate(
                     self._model, self._tokenizer,
                     prompt=formatted,

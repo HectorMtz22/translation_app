@@ -1,46 +1,112 @@
 """Column-based display mode: side-by-side transcription and translation."""
 
 from rich.cells import cell_len
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.text import Text
 
 console = Console()
 
 
 class ColumnsDisplay:
-    """Two-column layout with transcription on the left and translation on the right."""
+    """Two-column layout with Rich Live for in-place translation updates."""
 
     def __init__(self):
         self._last_speaker = None
+        self._entries = []      # Renderables in the live area
+        self._entry_map = {}    # entry_key -> index in _entries
+        self._live = None
+        # Keep entries bounded so Live doesn't exceed terminal height
+        self._max_entries = max(5, (console.height - 5) // 3)
 
-    def print_segment_header(self, speaker, timestamp, has_translator):
+    def start(self):
+        """Start the live display region."""
+        self._live = Live(
+            Group(*self._entries) if self._entries else Text(""),
+            console=console,
+            auto_refresh=False,
+            vertical_overflow="visible",
+        )
+        self._live.start()
+
+    def stop(self):
+        """Stop the live display, preserving content on screen."""
+        if self._live:
+            self._live.stop()
+            self._live = None
+
+    def _append(self, renderable, entry_key=None):
+        """Add a renderable to the live display."""
+        if self._live is None:
+            console.print(renderable)
+            return
+
+        self._entries.append(renderable)
+        if entry_key is not None:
+            self._entry_map[entry_key] = len(self._entries) - 1
+
+        # Commit oldest entries above the live area when buffer is full
+        while len(self._entries) > self._max_entries:
+            old = self._entries.pop(0)
+            self._live.console.print(old)
+            self._entry_map = {k: v - 1 for k, v in self._entry_map.items() if v > 0}
+
+        self._refresh()
+
+    def _refresh(self):
+        if self._live and self._entries:
+            self._live.update(Group(*self._entries))
+            self._live.refresh()
+
+    def print_segment_header(self, speaker, timestamp, has_translator,
+                             entry_key=None):
         """Print speaker header when speaker changes."""
         if speaker == self._last_speaker:
             return
         self._last_speaker = speaker
 
-        tw, indent, left_w, right_w = self._get_col_widths()
-        console.print(f"\n[dim]{'─' * tw}[/dim]")
-        console.print(f"[bold cyan][{timestamp}] {speaker}:[/bold cyan]")
+        tw, indent, left_w, _ = self._get_col_widths()
+
+        parts = [Text(f"\n{'─' * tw}", style="dim")]
+        parts.append(Text(f"[{timestamp}] {speaker}:", style="bold cyan"))
         if has_translator:
             header = Text()
             header.append(" " * indent)
             header.append(self._pad_display("TRANSCRIPTION", left_w), style="dim bold")
             header.append(" │ ", style="dim")
             header.append("TRANSLATION", style="dim bold")
-            console.print(header)
+            parts.append(header)
+
+        self._append(Group(*parts))
 
     def print_translated(self, speaker, text, translation, lang_tag,
-                         timestamp=None):
-        """Print original (left) and translation (right) instantly."""
+                         timestamp=None, entry_key=None):
+        """Print original (left) and translation (right)."""
         final_left = f"{text} [{lang_tag}]"
         right = f"→ {translation}" if translation else ""
-        console.print(self._render_columns(final_left, right))
+        self._append(self._render_columns(final_left, right), entry_key=entry_key)
 
     def print_without_translation(self, speaker, text, lang_tag,
-                                  timestamp=None):
-        """Print text instantly (no translation)."""
-        console.print(f"  [white]{text}[/white]  [dim][{lang_tag}][/dim]")
+                                  timestamp=None, entry_key=None):
+        """Print text (no translation)."""
+        content = Text()
+        content.append("  ")
+        content.append(text, style="white")
+        content.append(f"  [{lang_tag}]", style="dim")
+        self._append(content, entry_key=entry_key)
+
+    def update_translation(self, entry_key, speaker, text, new_translation,
+                           lang_tag, timestamp=None):
+        """Replace a previously printed translation in-place."""
+        idx = self._entry_map.get(entry_key)
+        if idx is None:
+            return  # Entry already committed above live area
+
+        final_left = f"{text} [{lang_tag}]"
+        right = f"→ {new_translation}" if new_translation else ""
+        self._entries[idx] = self._render_columns(
+            final_left, right, right_style="bold green")
+        self._refresh()
 
     # ─── Internal helpers ────────────────────────────────────────────────────
 
