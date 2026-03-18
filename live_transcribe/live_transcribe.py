@@ -56,7 +56,8 @@ except ImportError:
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000          # Whisper expects 16kHz
-WHISPER_MODEL = "./whisper-large-v3-ko-mlx"  # Fine-tuned for Korean, Q4 quantized
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"  # Distilled: same encoder, 4 decoder layers (vs 32); ~3-4x faster
+WHISPER_MODEL_FULL = "mlx-community/whisper-large-v3-mlx-4bit"  # Q4 quantized full model; 32 decoder layers, slower but max accuracy
 SPEAKER_SIMILARITY = 0.72    # Cosine similarity threshold for same speaker (lower = more lenient matching)
 NUM_SPEAKERS = 2             # Expected number of speakers (once reached, assigns to closest match)
 MAX_SPEAKERS = 3             # Maximum number of speakers to track
@@ -808,6 +809,8 @@ def main():
     parser = argparse.ArgumentParser(description="Live system audio transcription with speaker diarization")
     parser.add_argument("-d", "--device", type=int, default=None,
                         help="Input device index (skip interactive prompt)")
+    parser.add_argument("-m", "--model", choices=["turbo", "full"], default="turbo",
+                        help="Whisper model: turbo (fast, 4 decoder layers) or full (large-v3, 32 layers)")
     parser.add_argument("-t", "--translator", choices=["google", "deepl", "qwen", "none"], default=None,
                         help="Translation service: google, deepl, or none to disable")
     parser.add_argument("--translate-from", default=None,
@@ -979,11 +982,15 @@ def main():
 
         summarizer = SummarizerProcess(target_lang=target_lang, on_summary=on_summary)
 
+    # Select Whisper model
+    model_repo = WHISPER_MODEL if args.model == "turbo" else WHISPER_MODEL_FULL
+    print(f"Using Whisper model: {model_repo}")
+
     # Start transcription
     transcriber = LiveTranscriber(
         device_idx, translator=translator,
         translate_langs=translate_langs, target_lang=target_lang,
-        display_mode=display_mode, summarizer=summarizer,
+        model_repo=model_repo, display_mode=display_mode, summarizer=summarizer,
     )
 
     # Share the GPU lock with Qwen so Whisper and Qwen don't collide on Metal
