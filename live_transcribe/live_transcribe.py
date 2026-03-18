@@ -56,7 +56,7 @@ except ImportError:
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000          # Whisper expects 16kHz
-WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx-4bit"  # Q4 quantized; 3x smaller, retains all 32 decoder layers
+WHISPER_MODEL = "./whisper-large-v3-ko-mlx"  # Fine-tuned for Korean, Q4 quantized
 SPEAKER_SIMILARITY = 0.72    # Cosine similarity threshold for same speaker (lower = more lenient matching)
 NUM_SPEAKERS = 2             # Expected number of speakers (once reached, assigns to closest match)
 MAX_SPEAKERS = 3             # Maximum number of speakers to track
