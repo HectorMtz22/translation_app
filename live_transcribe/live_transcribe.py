@@ -44,6 +44,7 @@ from summarizer import SummarizerProcess
 from translator import Translator
 from deepl_translator import DeepLTranslator
 from qwen_translator import QwenTranslator
+from nllb_translator import NLLBTranslator
 
 # Try to import resemblyzer for speaker diarization
 try:
@@ -56,8 +57,9 @@ except ImportError:
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 16000          # Whisper expects 16kHz
-WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"  # Distilled: same encoder, 4 decoder layers (vs 32); ~3-4x faster
-WHISPER_MODEL_FULL = "mlx-community/whisper-large-v3-mlx-4bit"  # Q4 quantized full model; 32 decoder layers, slower but max accuracy
+WHISPER_MODEL = "mlx-community/whisper-medium-mlx-q4"  # Q4 quantized medium; fast enough for real-time, decent multilingual quality
+WHISPER_MODEL_TURBO = "mlx-community/whisper-large-v3-turbo"  # Distilled: same encoder, 4 decoder layers (vs 32); higher quality, slower
+WHISPER_MODEL_FULL = "mlx-community/whisper-large-v3-mlx-4bit"  # Q4 quantized full model; 32 decoder layers, slowest but max accuracy
 SPEAKER_SIMILARITY = 0.72    # Cosine similarity threshold for same speaker (lower = more lenient matching)
 NUM_SPEAKERS = 2             # Expected number of speakers (once reached, assigns to closest match)
 MAX_SPEAKERS = 3             # Maximum number of speakers to track
@@ -809,9 +811,9 @@ def main():
     parser = argparse.ArgumentParser(description="Live system audio transcription with speaker diarization")
     parser.add_argument("-d", "--device", type=int, default=None,
                         help="Input device index (skip interactive prompt)")
-    parser.add_argument("-m", "--model", choices=["turbo", "full"], default="turbo",
-                        help="Whisper model: turbo (fast, 4 decoder layers) or full (large-v3, 32 layers)")
-    parser.add_argument("-t", "--translator", choices=["google", "deepl", "qwen", "none"], default=None,
+    parser.add_argument("-m", "--model", choices=["medium", "turbo", "full"], default="medium",
+                        help="Whisper model: medium (fast, real-time), turbo (4 decoder layers), or full (large-v3, 32 layers)")
+    parser.add_argument("-t", "--translator", choices=["google", "deepl", "qwen", "nllb", "none"], default=None,
                         help="Translation service: google, deepl, or none to disable")
     parser.add_argument("--translate-from", default=None,
                         help="Comma-separated source language codes to translate (default: ko)")
@@ -857,7 +859,8 @@ def main():
         print("  [1] Google Translate")
         print("  [2] DeepL")
         print("  [3] Qwen (local LLM, offline)")
-        print("  [4] None (transcription only)")
+        print("  [4] NLLB-200 (local, offline, specialized translation)")
+        print("  [5] None (transcription only)")
         print()
         try:
             t_choice = input("Select translation service [Enter=1]: ").strip()
@@ -866,6 +869,8 @@ def main():
             elif t_choice == "3":
                 translator_choice = "qwen"
             elif t_choice == "4":
+                translator_choice = "nllb"
+            elif t_choice == "5":
                 translator_choice = "none"
             else:
                 translator_choice = "google"
@@ -936,6 +941,9 @@ def main():
         elif translator_choice == "qwen":
             translator = QwenTranslator(target_lang=target_lang)
             print(f"Using translator: Qwen (local LLM)")
+        elif translator_choice == "nllb":
+            translator = NLLBTranslator(target_lang=target_lang)
+            print(f"Using translator: NLLB-200 (local)")
         else:
             translator = Translator(target_lang=target_lang)
             print(f"Using translator: Google Translate")
@@ -983,7 +991,8 @@ def main():
         summarizer = SummarizerProcess(target_lang=target_lang, on_summary=on_summary)
 
     # Select Whisper model
-    model_repo = WHISPER_MODEL if args.model == "turbo" else WHISPER_MODEL_FULL
+    model_map = {"medium": WHISPER_MODEL, "turbo": WHISPER_MODEL_TURBO, "full": WHISPER_MODEL_FULL}
+    model_repo = model_map[args.model]
     print(f"Using Whisper model: {model_repo}")
 
     # Start transcription
