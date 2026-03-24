@@ -64,9 +64,7 @@ final class SpeechRecognitionSession: @unchecked Sendable {
 
         // Create recognition request
         let request = SFSpeechAudioBufferRecognitionRequest()
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        request.requiresOnDeviceRecognition = false
         request.shouldReportPartialResults = true
         request.addsPunctuation = true
         self.request = request

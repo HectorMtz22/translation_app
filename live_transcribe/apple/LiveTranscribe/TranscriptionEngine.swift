@@ -10,8 +10,8 @@ enum RecognitionBackend: String, CaseIterable, Identifiable, Sendable {
 
     var displayName: String {
         switch self {
-        case .speechAnalyzer: "SpeechAnalyzer (Live Translate)"
-        case .sfSpeechRecognizer: "SFSpeechRecognizer (Dictation)"
+        case .speechAnalyzer: "SpeechAnalyzer (Offline)"
+        case .sfSpeechRecognizer: "SFSpeechRecognizer (Online)"
         }
     }
 }
