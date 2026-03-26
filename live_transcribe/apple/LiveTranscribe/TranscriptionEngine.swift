@@ -32,6 +32,11 @@ final class TranscriptionEngine {
     var status = "Ready"
     var errorMessage: String?
 
+    // Audio level metrics for waveform visualization
+    var audioRMS: Float = 0
+    var audioGain: Float = 1
+    var waveformSamples: [Float] = Array(repeating: 0, count: AudioMetrics.waveformLength)
+
     var translationConfig: TranslationSession.Configuration? {
         guard isTranslationEnabled, sourceLanguage != targetLanguage else { return nil }
         return .init(
@@ -45,6 +50,7 @@ final class TranscriptionEngine {
     private var analyzerSession: SpeechAnalyzerSession?
     private var recognizerSession: SpeechRecognitionSession?
     private var resultTask: Task<Void, Never>?
+    private var metricsTask: Task<Void, Never>?
     private var translationContinuation: AsyncStream<TranslationRequest>.Continuation?
 
     // MARK: - Lifecycle
@@ -107,6 +113,18 @@ final class TranscriptionEngine {
         isListening = true
         status = "Listening..."
 
+        // Poll audio metrics ~20 times per second for smooth waveform
+        let metrics: AudioMetrics? = analyzerSession?.audioMetrics ?? recognizerSession?.audioMetrics
+        metricsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(50))
+                guard let self, let metrics else { break }
+                self.audioRMS = metrics.rms
+                self.audioGain = metrics.gain
+                self.waveformSamples = metrics.waveform
+            }
+        }
+
         // Consume results on MainActor
         resultTask = Task { [weak self] in
             for await result in resultStream {
@@ -147,12 +165,17 @@ final class TranscriptionEngine {
         analyzerSession?.stop()
         recognizerSession?.stop()
         resultTask?.cancel()
+        metricsTask?.cancel()
 
         analyzerSession = nil
         recognizerSession = nil
         resultTask = nil
+        metricsTask = nil
         isListening = false
         volatileText = ""
+        audioRMS = 0
+        audioGain = 1
+        waveformSamples = Array(repeating: 0, count: AudioMetrics.waveformLength)
         status = "Stopped"
     }
 

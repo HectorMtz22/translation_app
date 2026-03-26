@@ -8,6 +8,15 @@ struct ContentView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 controlsBar
+                if engine.isListening {
+                    AudioLevelView(
+                        waveform: engine.waveformSamples,
+                        rms: engine.audioRMS,
+                        gain: engine.audioGain
+                    )
+                    .frame(height: 50)
+                    .padding(.horizontal)
+                }
                 Divider()
                 transcriptList
             }
@@ -207,6 +216,48 @@ private struct TranscriptRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Audio Level Waveform
+
+private struct AudioLevelView: View {
+    let waveform: [Float]
+    let rms: Float
+    let gain: Float
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // Waveform bars
+            HStack(alignment: .center, spacing: 1.5) {
+                ForEach(Array(waveform.enumerated()), id: \.offset) { _, level in
+                    let normalized = min(1.0, level * 10) // scale RMS to visible range
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(barColor(for: level))
+                        .frame(width: 3, height: max(2, CGFloat(normalized) * 40))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .animation(.linear(duration: 0.05), value: waveform)
+
+            // RMS + Gain labels
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("RMS \(String(format: "%.4f", rms))")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text("Gain \(String(format: "%.1fx", gain))")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(gain > 1.0 ? .orange : .secondary)
+            }
+            .frame(width: 90, alignment: .trailing)
+        }
+    }
+
+    private func barColor(for level: Float) -> Color {
+        if level < 0.005 { return .gray.opacity(0.3) }
+        if level < 0.02 { return .yellow }
+        if level < 0.1 { return .green }
+        return .red
     }
 }
 

@@ -56,3 +56,48 @@ struct TranslationRequest: Sendable {
     let id: UUID
     let text: String
 }
+
+// MARK: - Audio Metrics
+
+/// Thread-safe container for real-time audio level data, updated from the audio tap
+/// and read by the UI for waveform visualization.
+final class AudioMetrics: @unchecked Sendable {
+    /// Number of RMS samples to keep for the waveform display.
+    static let waveformLength = 40
+
+    private let lock = NSLock()
+    private var _rms: Float = 0
+    private var _gain: Float = 1
+    private var _waveform: [Float] = Array(repeating: 0, count: waveformLength)
+
+    var rms: Float {
+        lock.withLock { _rms }
+    }
+
+    var gain: Float {
+        lock.withLock { _gain }
+    }
+
+    var waveform: [Float] {
+        lock.withLock { _waveform }
+    }
+
+    func update(rms: Float, gain: Float) {
+        lock.withLock {
+            _rms = rms
+            _gain = gain
+            _waveform.append(rms)
+            if _waveform.count > Self.waveformLength {
+                _waveform.removeFirst(_waveform.count - Self.waveformLength)
+            }
+        }
+    }
+
+    func reset() {
+        lock.withLock {
+            _rms = 0
+            _gain = 1
+            _waveform = Array(repeating: 0, count: Self.waveformLength)
+        }
+    }
+}

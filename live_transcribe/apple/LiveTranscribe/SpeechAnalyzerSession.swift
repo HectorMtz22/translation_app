@@ -8,6 +8,8 @@ private let logger = Logger(subsystem: "com.livetranscribe", category: "SpeechAn
 /// no closures inherit @MainActor isolation (avoiding Swift 6 dispatch_assert_queue traps).
 ///
 /// Results are delivered via an AsyncStream of simple Sendable values.
+/// The analyzer is automatically restarted every `maxFinalResultsBeforeRestart`
+/// final results to prevent recognition quality degradation over long sessions.
 final class SpeechAnalyzerSession: @unchecked Sendable {
 
     struct Result: Sendable {
@@ -20,6 +22,11 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
     private var transcriber: DictationTranscriber?
     private var audioEngine: AVAudioEngine?
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var isStopped = false
+    let audioMetrics = AudioMetrics()
+
+    /// How many final results before the analyzer is restarted to keep quality high.
+    private let maxFinalResultsBeforeRestart = 15
 
     // MARK: - Custom Language Model
 
@@ -95,6 +102,7 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
     // MARK: - Start / Stop
 
     /// Starts speech recognition via SpeechAnalyzer with DictationTranscriber and returns an AsyncStream of results.
+    /// The analyzer automatically restarts periodically to maintain recognition quality.
     func start(locale: Locale) throws -> AsyncStream<Result> {
         let (resultStream, resultContinuation) = AsyncStream<Result>.makeStream()
         let capturedLocale = locale
@@ -102,7 +110,7 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
         // Start a detached task to handle the async setup and result consumption
         Task.detached { [weak self] in
             do {
-                // Prepare custom language model for Korean
+                // Prepare custom language model for Korean (once)
                 var contentHints: Set<DictationTranscriber.ContentHint> = []
                 let isKorean = capturedLocale.identifier.hasPrefix("ko")
                 if isKorean {
@@ -116,63 +124,32 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
                     }
                 }
 
-                let transcriber = DictationTranscriber(
+                // Query the optimal audio format using a temporary transcriber
+                let formatQueryTranscriber = DictationTranscriber(
                     locale: capturedLocale,
                     contentHints: contentHints,
                     transcriptionOptions: [.punctuation],
                     reportingOptions: [.volatileResults],
                     attributeOptions: [.audioTimeRange]
                 )
-                self?.transcriber = transcriber
-
-                let analyzer = SpeechAnalyzer(modules: [transcriber])
-                self?.analyzer = analyzer
-
-                // Download model if needed — verify full model installation
-                logger.info("Checking asset installation for locale: \(capturedLocale.identifier)")
-                if let downloader = try await AssetInventory.assetInstallationRequest(
-                    supporting: [transcriber]
-                ) {
-                    logger.info("Downloading speech model for \(capturedLocale.identifier)...")
-                    try await downloader.downloadAndInstall()
-                    logger.info("Speech model download complete for \(capturedLocale.identifier)")
-                } else {
-                    logger.info("Speech model already installed for \(capturedLocale.identifier)")
-                }
-
-                // Verify the model is installed after download attempt
-                let installedLocales = await DictationTranscriber.installedLocales
-                let isInstalled = installedLocales.contains { $0.identifier.hasPrefix(capturedLocale.language.languageCode?.identifier ?? "") }
-                if isInstalled {
-                    logger.info("Verified: speech model installed for \(capturedLocale.identifier)")
-                } else {
-                    logger.warning("Speech model for \(capturedLocale.identifier) may not be fully installed. Installed locales: \(installedLocales.map(\.identifier))")
-                }
-
-                // Get optimal audio format
                 let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
-                    compatibleWith: [transcriber]
+                    compatibleWith: [formatQueryTranscriber]
                 )
 
-                // Create input stream for the analyzer
-                let (inputStream, inputCont) = AsyncStream<AnalyzerInput>.makeStream()
-                self?.inputContinuation = inputCont
-
-                // Start the analyzer
-                try await analyzer.start(inputSequence: inputStream)
-
-                // Set up audio engine
+                // Set up audio engine once — it stays running across analyzer restarts
                 try self?.setupAudioEngine(analyzerFormat: analyzerFormat)
 
-                // Consume transcription results
-                for try await result in transcriber.results {
-                    let text = String(result.text.characters)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !text.isEmpty else { continue }
-
-                    resultContinuation.yield(
-                        Result(text: text, isFinal: result.isFinal, error: nil)
+                // Restart loop — recreates the analyzer periodically to prevent degradation
+                while let self, !self.isStopped, !Task.isCancelled {
+                    let finalCount = try await self.runAnalyzerCycle(
+                        locale: capturedLocale,
+                        contentHints: contentHints,
+                        resultContinuation: resultContinuation
                     )
+
+                    if self.isStopped || Task.isCancelled { break }
+
+                    logger.info("Restarting analyzer after \(finalCount) final results to maintain quality")
                 }
 
                 resultContinuation.finish()
@@ -190,11 +167,88 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
         return resultStream
     }
 
+    /// Runs a single analyzer cycle. Returns the number of final results received
+    /// before the cycle ends (either due to reaching the restart threshold or the stream ending).
+    private func runAnalyzerCycle(
+        locale: Locale,
+        contentHints: Set<DictationTranscriber.ContentHint>,
+        resultContinuation: AsyncStream<Result>.Continuation
+    ) async throws -> Int {
+        let transcriber = DictationTranscriber(
+            locale: locale,
+            contentHints: contentHints,
+            transcriptionOptions: [.punctuation],
+            reportingOptions: [.volatileResults],
+            attributeOptions: [.audioTimeRange]
+        )
+        self.transcriber = transcriber
+
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        self.analyzer = analyzer
+
+        // Download model if needed (no-op after first download)
+        if let downloader = try await AssetInventory.assetInstallationRequest(
+            supporting: [transcriber]
+        ) {
+            logger.info("Downloading speech model for \(locale.identifier)...")
+            try await downloader.downloadAndInstall()
+            logger.info("Speech model download complete for \(locale.identifier)")
+        }
+
+        // Create input stream for this analyzer cycle
+        let (inputStream, inputCont) = AsyncStream<AnalyzerInput>.makeStream()
+        self.inputContinuation = inputCont
+
+        // Start the analyzer
+        try await analyzer.start(inputSequence: inputStream)
+        logger.info("Analyzer cycle started for \(locale.identifier)")
+
+        // Consume transcription results until we hit the restart threshold
+        var finalResultCount = 0
+        for try await result in transcriber.results {
+            guard !isStopped, !Task.isCancelled else { break }
+
+            let text = String(result.text.characters)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+
+            resultContinuation.yield(
+                Result(text: text, isFinal: result.isFinal, error: nil)
+            )
+
+            if result.isFinal {
+                finalResultCount += 1
+                if finalResultCount >= maxFinalResultsBeforeRestart {
+                    break
+                }
+            }
+        }
+
+        // Create a temporary "bridge" continuation so the audio tap keeps flowing
+        // while we tear down the old analyzer. The next cycle will replace it.
+        let (bridgeStream, bridgeCont) = AsyncStream<AnalyzerInput>.makeStream()
+        self.inputContinuation = bridgeCont
+        // Discard bridge buffers (they're just to avoid dropping audio during teardown)
+        Task.detached { for await _ in bridgeStream {} }
+
+        // Now tear down this cycle's analyzer
+        inputCont.finish()
+        try? await analyzer.finalizeAndFinishThroughEndOfInput()
+        self.analyzer = nil
+        self.transcriber = nil
+
+        return finalResultCount
+    }
+
     private func setupAudioEngine(analyzerFormat: AVAudioFormat?) throws {
         #if os(iOS)
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.record, mode: .measurement)
         try audioSession.setActive(true)
+        // Boost hardware input gain for better sensitivity to quiet voices
+        if audioSession.isInputGainSettable {
+            try? audioSession.setInputGain(1.0)
+        }
         #endif
 
         let engine = AVAudioEngine()
@@ -214,7 +268,6 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
             converter = nil
         }
 
-        let continuation = inputContinuation
         let targetFormat = analyzerFormat
 
         // Serial queue for format conversion (off the realtime audio thread)
@@ -223,10 +276,18 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
             qos: .userInteractive
         )
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { buffer, _ in
-            convertQueue.async {
+        // The tap reads self.inputContinuation each time, so when we restart the
+        // analyzer and swap the continuation, audio flows to the new analyzer.
+        let metrics = self.audioMetrics
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { [weak self] buffer, _ in
+            // Amplify audio for better sensitivity to quiet voices
+            Self.adaptiveAmplify(buffer, metrics: metrics)
+
+            convertQueue.async { [weak self] in
+                guard let currentContinuation = self?.inputContinuation else { return }
+
                 guard let targetFormat, let converter else {
-                    continuation?.yield(AnalyzerInput(buffer: buffer))
+                    currentContinuation.yield(AnalyzerInput(buffer: buffer))
                     return
                 }
 
@@ -251,7 +312,7 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
                 }
 
                 if status == .haveData || status == .inputRanDry {
-                    continuation?.yield(AnalyzerInput(buffer: output))
+                    currentContinuation.yield(AnalyzerInput(buffer: output))
                 }
             }
         }
@@ -262,6 +323,8 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
     }
 
     func stop() {
+        isStopped = true
+
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         inputContinuation?.finish()
@@ -274,6 +337,44 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
         analyzer = nil
         transcriber = nil
         inputContinuation = nil
+    }
+
+    // MARK: - Adaptive Audio Amplification
+
+    /// Adaptively amplifies quiet audio buffers to improve speech recognition sensitivity.
+    /// Only boosts audio when the level is below a threshold — leaves normal/loud audio untouched.
+    /// Updates the provided AudioMetrics with the current RMS level and applied gain.
+    private static func adaptiveAmplify(_ buffer: AVAudioPCMBuffer, metrics: AudioMetrics) {
+        guard let floatData = buffer.floatChannelData else { return }
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+
+        // Calculate RMS (root mean square) level of the buffer
+        var sumSquares: Float = 0
+        let channelData = floatData[0]
+        for frame in 0..<frameCount {
+            let sample = channelData[frame]
+            sumSquares += sample * sample
+        }
+        let rms = sqrtf(sumSquares / Float(frameCount))
+
+        // Only amplify if audio is quiet (RMS below threshold)
+        let quietThreshold: Float = 0.02
+        if rms < quietThreshold, rms > 0.0001 {
+            let maxGain: Float = 3.0
+            let targetRMS: Float = 0.04
+            let gain = min(maxGain, targetRMS / rms)
+
+            for channel in 0..<Int(buffer.format.channelCount) {
+                let data = floatData[channel]
+                for frame in 0..<frameCount {
+                    data[frame] = max(-1.0, min(1.0, data[frame] * gain))
+                }
+            }
+            metrics.update(rms: rms, gain: gain)
+        } else {
+            metrics.update(rms: rms, gain: 1.0)
+        }
     }
 
     // MARK: - Errors
