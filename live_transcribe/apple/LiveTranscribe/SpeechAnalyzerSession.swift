@@ -359,10 +359,10 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
         let rms = sqrtf(sumSquares / Float(frameCount))
 
         // Only amplify if audio is quiet (RMS below threshold)
-        let quietThreshold: Float = 0.02
-        if rms < quietThreshold, rms > 0.0001 {
-            let maxGain: Float = 3.0
-            let targetRMS: Float = 0.04
+        let quietThreshold: Float = 0.05
+        if rms < quietThreshold, rms > 0.00005 {
+            let maxGain: Float = 10.0
+            let targetRMS: Float = 0.08
             let gain = min(maxGain, targetRMS / rms)
 
             for channel in 0..<Int(buffer.format.channelCount) {

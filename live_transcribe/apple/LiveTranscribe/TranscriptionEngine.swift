@@ -24,6 +24,7 @@ final class TranscriptionEngine {
 
     var entries: [TranscriptEntry] = []
     var volatileText = ""
+    var volatileTranslation = ""
     var isListening = false
     var sourceLanguage: AppLanguage = .korean
     var targetLanguage: AppLanguage = .english
@@ -52,6 +53,8 @@ final class TranscriptionEngine {
     private var resultTask: Task<Void, Never>?
     private var metricsTask: Task<Void, Never>?
     private var translationContinuation: AsyncStream<TranslationRequest>.Continuation?
+    private var volatileTranslationContinuation: AsyncStream<String>.Continuation?
+    private var volatileDebounceTask: Task<Void, Never>?
 
     // MARK: - Lifecycle
 
@@ -148,6 +151,8 @@ final class TranscriptionEngine {
 
                     self.entries.append(entry)
                     self.volatileText = ""
+                    self.volatileTranslation = ""
+                    self.volatileDebounceTask?.cancel()
 
                     if shouldTranslate {
                         self.translationContinuation?.yield(
@@ -156,6 +161,7 @@ final class TranscriptionEngine {
                     }
                 } else {
                     self.volatileText = result.text
+                    self.scheduleVolatileTranslation(result.text)
                 }
             }
         }
@@ -166,13 +172,16 @@ final class TranscriptionEngine {
         recognizerSession?.stop()
         resultTask?.cancel()
         metricsTask?.cancel()
+        volatileDebounceTask?.cancel()
 
         analyzerSession = nil
         recognizerSession = nil
         resultTask = nil
         metricsTask = nil
+        volatileDebounceTask = nil
         isListening = false
         volatileText = ""
+        volatileTranslation = ""
         audioRMS = 0
         audioGain = 1
         waveformSamples = Array(repeating: 0, count: AudioMetrics.waveformLength)
@@ -201,6 +210,34 @@ final class TranscriptionEngine {
         guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
         entries[idx].translation = result
         entries[idx].isTranslating = false
+    }
+
+    // MARK: - Volatile (real-time) translation
+
+    func makeVolatileTranslationStream() -> AsyncStream<String> {
+        volatileTranslationContinuation?.finish()
+
+        let (stream, continuation) = AsyncStream<String>.makeStream()
+        volatileTranslationContinuation = continuation
+        return stream
+    }
+
+    func completeVolatileTranslation(_ text: String?) {
+        volatileTranslation = text ?? ""
+    }
+
+    private func scheduleVolatileTranslation(_ text: String) {
+        volatileDebounceTask?.cancel()
+        let shouldTranslate = isTranslationEnabled && sourceLanguage != targetLanguage
+        guard shouldTranslate, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        volatileDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, let self else { return }
+            self.volatileTranslationContinuation?.yield(text)
+        }
     }
 
     // MARK: - Utilities

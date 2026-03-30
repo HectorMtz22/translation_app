@@ -48,6 +48,19 @@ struct ContentView: View {
             .translationTask(engine.translationConfig) { session in
                 // Get stream + pending entries from engine
                 let (stream, pending) = engine.makeTranslationStream()
+                let volatileStream = engine.makeVolatileTranslationStream()
+
+                // Translate volatile (partial) text in real-time
+                let volatileTask = Task {
+                    for await text in volatileStream {
+                        guard !Task.isCancelled else { break }
+                        let response = try? await session.translate(text)
+                        // Only apply if volatile text hasn't changed
+                        if engine.volatileText == text {
+                            engine.completeVolatileTranslation(response?.targetText)
+                        }
+                    }
+                }
 
                 // Batch-translate already-pending entries
                 for item in pending {
@@ -65,6 +78,8 @@ struct ContentView: View {
                         id: request.id, result: response?.targetText
                     )
                 }
+
+                volatileTask.cancel()
             }
         }
     }
@@ -152,10 +167,18 @@ struct ContentView: View {
                 }
 
                 if !engine.volatileText.isEmpty {
-                    Text(engine.volatileText)
-                        .foregroundStyle(.secondary)
-                        .italic()
-                        .id("volatile")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(engine.volatileText)
+                            .foregroundStyle(.secondary)
+                            .italic()
+                        if !engine.volatileTranslation.isEmpty {
+                            Text("→ \(engine.volatileTranslation)")
+                                .font(.body)
+                                .foregroundStyle(.orange.opacity(0.7))
+                                .italic()
+                        }
+                    }
+                    .id("volatile")
                 }
             }
             .listStyle(.plain)
