@@ -55,6 +55,12 @@ final class TranscriptionEngine {
     private var translationContinuation: AsyncStream<TranslationRequest>.Continuation?
     private var volatileTranslationContinuation: AsyncStream<String>.Continuation?
     private var volatileDebounceTask: Task<Void, Never>?
+    private var silenceTask: Task<Void, Never>?
+
+    /// How long audio must stay silent before finalizing volatile text (seconds).
+    private let silenceTimeout: Duration = .milliseconds(1500)
+    /// RMS below this level counts as silence.
+    private let silenceThreshold: Float = 0.005
 
     // MARK: - Lifecycle
 
@@ -117,6 +123,7 @@ final class TranscriptionEngine {
         status = "Listening..."
 
         // Poll audio metrics ~20 times per second for smooth waveform
+        // and detect silence to finalize lingering volatile text
         let metrics: AudioMetrics? = analyzerSession?.audioMetrics ?? recognizerSession?.audioMetrics
         metricsTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -125,6 +132,26 @@ final class TranscriptionEngine {
                 self.audioRMS = metrics.rms
                 self.audioGain = metrics.gain
                 self.waveformSamples = metrics.waveform
+
+                // Silence detection: if we have volatile text and audio is silent,
+                // start a timer to finalize it
+                if !self.volatileText.isEmpty && self.audioRMS < self.silenceThreshold {
+                    if self.silenceTask == nil {
+                        self.silenceTask = Task { [weak self] in
+                            try? await Task.sleep(for: self?.silenceTimeout ?? .milliseconds(1500))
+                            guard !Task.isCancelled, let self else { return }
+                            // Still silent and still have volatile text? Finalize it.
+                            if !self.volatileText.isEmpty && self.audioRMS < self.silenceThreshold {
+                                self.finalizeVolatileText()
+                            }
+                            self.silenceTask = nil
+                        }
+                    }
+                } else {
+                    // Audio is active or no volatile text — cancel silence timer
+                    self.silenceTask?.cancel()
+                    self.silenceTask = nil
+                }
             }
         }
 
@@ -173,12 +200,14 @@ final class TranscriptionEngine {
         resultTask?.cancel()
         metricsTask?.cancel()
         volatileDebounceTask?.cancel()
+        silenceTask?.cancel()
 
         analyzerSession = nil
         recognizerSession = nil
         resultTask = nil
         metricsTask = nil
         volatileDebounceTask = nil
+        silenceTask = nil
         isListening = false
         volatileText = ""
         volatileTranslation = ""
@@ -237,6 +266,31 @@ final class TranscriptionEngine {
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled, let self else { return }
             self.volatileTranslationContinuation?.yield(text)
+        }
+    }
+
+    // MARK: - Silence-based finalization
+
+    /// Promotes the current volatile text to a finalized entry when silence is detected.
+    private func finalizeVolatileText() {
+        let text = volatileText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+
+        var entry = TranscriptEntry(text: text, language: sourceLanguage)
+        let shouldTranslate = isTranslationEnabled && sourceLanguage != targetLanguage
+        if shouldTranslate {
+            entry.isTranslating = true
+        }
+
+        entries.append(entry)
+        volatileText = ""
+        volatileTranslation = ""
+        volatileDebounceTask?.cancel()
+
+        if shouldTranslate {
+            translationContinuation?.yield(
+                TranslationRequest(id: entry.id, text: text)
+            )
         }
     }
 
