@@ -208,12 +208,12 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
         for try await result in transcriber.results {
             guard !isStopped, !Task.isCancelled else { break }
 
-            let text = String(result.text.characters)
+            let fullText = String(result.text.characters)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            guard !fullText.isEmpty else { continue }
 
             resultContinuation.yield(
-                Result(text: text, isFinal: result.isFinal, error: nil)
+                Result(text: fullText, isFinal: result.isFinal, error: nil)
             )
 
             if result.isFinal {

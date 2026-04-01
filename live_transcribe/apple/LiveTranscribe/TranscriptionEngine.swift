@@ -57,6 +57,12 @@ final class TranscriptionEngine {
     private var volatileDebounceTask: Task<Void, Never>?
     private var silenceTask: Task<Void, Never>?
 
+    /// The raw cumulative text from the analyzer at the point we last finalized.
+    /// Used to strip repeated prefixes from subsequent results.
+    private var lastFinalizedCumulative = ""
+    /// The raw cumulative text from the most recent result (before stripping).
+    private var lastRawCumulative = ""
+
     /// How long audio must stay silent before finalizing volatile text (seconds).
     private let silenceTimeout: Duration = .milliseconds(1500)
     /// RMS below this level counts as silence.
@@ -165,9 +171,15 @@ final class TranscriptionEngine {
                     continue
                 }
 
+                // Strip already-finalized text (the analyzer accumulates from cycle start)
+                let strippedText = self.stripFinalized(result.text)
+                self.lastRawCumulative = result.text
+
                 if result.isFinal {
+                    guard !strippedText.isEmpty else { continue }
+
                     var entry = TranscriptEntry(
-                        text: result.text, language: self.sourceLanguage
+                        text: strippedText, language: self.sourceLanguage
                     )
                     let shouldTranslate =
                         self.isTranslationEnabled
@@ -176,6 +188,7 @@ final class TranscriptionEngine {
                         entry.isTranslating = true
                     }
 
+                    self.lastFinalizedCumulative = result.text
                     self.entries.append(entry)
                     self.volatileText = ""
                     self.volatileTranslation = ""
@@ -183,12 +196,13 @@ final class TranscriptionEngine {
 
                     if shouldTranslate {
                         self.translationContinuation?.yield(
-                            TranslationRequest(id: entry.id, text: result.text)
+                            TranslationRequest(id: entry.id, text: strippedText)
                         )
                     }
                 } else {
-                    self.volatileText = result.text
-                    self.scheduleVolatileTranslation(result.text)
+                    guard !strippedText.isEmpty else { continue }
+                    self.volatileText = strippedText
+                    self.scheduleVolatileTranslation(strippedText)
                 }
             }
         }
@@ -208,6 +222,8 @@ final class TranscriptionEngine {
         metricsTask = nil
         volatileDebounceTask = nil
         silenceTask = nil
+        lastFinalizedCumulative = ""
+        lastRawCumulative = ""
         isListening = false
         volatileText = ""
         volatileTranslation = ""
@@ -282,6 +298,10 @@ final class TranscriptionEngine {
             entry.isTranslating = true
         }
 
+        // Mark the analyzer's cumulative position so future results get stripped correctly.
+        // lastRawCumulative holds the full unstripped text from the most recent result.
+        lastFinalizedCumulative = lastRawCumulative
+
         entries.append(entry)
         volatileText = ""
         volatileTranslation = ""
@@ -299,6 +319,48 @@ final class TranscriptionEngine {
     func clearTranscript() {
         entries.removeAll()
         volatileText = ""
+        lastFinalizedCumulative = ""
+        lastRawCumulative = ""
+    }
+
+    // MARK: - Text deduplication
+
+    /// Strips the already-finalized prefix from a raw analyzer result.
+    /// The analyzer accumulates text from the start of each cycle, so successive
+    /// results repeat everything that came before.
+    private func stripFinalized(_ rawText: String) -> String {
+        guard !lastFinalizedCumulative.isEmpty else { return rawText }
+
+        // Fast path: exact prefix
+        if rawText.hasPrefix(lastFinalizedCumulative) {
+            return String(rawText.dropFirst(lastFinalizedCumulative.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Slow path: longest common prefix (transcriber may revise earlier words slightly)
+        let rawChars = Array(rawText)
+        let finChars = Array(lastFinalizedCumulative)
+        let limit = min(rawChars.count, finChars.count)
+        var commonEnd = 0
+        for i in 0..<limit {
+            if rawChars[i] == finChars[i] {
+                commonEnd = i + 1
+            } else {
+                break
+            }
+        }
+
+        // Only strip if ≥60% of the finalized text matched
+        guard commonEnd >= finChars.count * 6 / 10 else { return rawText }
+
+        // Snap forward to next space to avoid cutting mid-word
+        var dropCount = commonEnd
+        while dropCount < rawChars.count && rawChars[dropCount] != " " {
+            dropCount += 1
+        }
+
+        return String(rawText.dropFirst(dropCount))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func exportTranscript() -> String {
