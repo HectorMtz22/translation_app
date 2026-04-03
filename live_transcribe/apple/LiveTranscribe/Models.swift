@@ -61,6 +61,8 @@ struct TranslationRequest: Sendable {
 
 /// Thread-safe container for real-time audio level data, updated from the audio tap
 /// and read by the UI for waveform visualization.
+///
+/// Uses a fixed-size circular buffer for O(1) append instead of Array's O(n) removeFirst.
 final class AudioMetrics: @unchecked Sendable {
     /// Number of RMS samples to keep for the waveform display.
     static let waveformLength = 40
@@ -68,7 +70,10 @@ final class AudioMetrics: @unchecked Sendable {
     private let lock = NSLock()
     private var _rms: Float = 0
     private var _gain: Float = 1
-    private var _waveform: [Float] = Array(repeating: 0, count: waveformLength)
+    /// Circular buffer backing storage.
+    private var _ring = [Float](repeating: 0, count: waveformLength)
+    /// Write index into _ring (wraps around).
+    private var _ringIndex = 0
 
     var rms: Float {
         lock.withLock { _rms }
@@ -78,18 +83,22 @@ final class AudioMetrics: @unchecked Sendable {
         lock.withLock { _gain }
     }
 
+    /// Returns the waveform samples in chronological order.
     var waveform: [Float] {
-        lock.withLock { _waveform }
+        lock.withLock {
+            let len = Self.waveformLength
+            // _ringIndex points to the next write slot, so the oldest sample is at _ringIndex
+            let start = _ringIndex % len
+            return Array(_ring[start..<len]) + Array(_ring[0..<start])
+        }
     }
 
     func update(rms: Float, gain: Float) {
         lock.withLock {
             _rms = rms
             _gain = gain
-            _waveform.append(rms)
-            if _waveform.count > Self.waveformLength {
-                _waveform.removeFirst(_waveform.count - Self.waveformLength)
-            }
+            _ring[_ringIndex % Self.waveformLength] = rms
+            _ringIndex = (_ringIndex + 1) % Self.waveformLength
         }
     }
 
@@ -97,7 +106,8 @@ final class AudioMetrics: @unchecked Sendable {
         lock.withLock {
             _rms = 0
             _gain = 1
-            _waveform = Array(repeating: 0, count: Self.waveformLength)
+            _ring = [Float](repeating: 0, count: Self.waveformLength)
+            _ringIndex = 0
         }
     }
 }

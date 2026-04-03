@@ -36,20 +36,50 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
             .appendingPathComponent("CustomLanguageModels", isDirectory: true)
     }
 
+    /// Cached Korean language model configuration, shared across all sessions.
+    nonisolated(unsafe) private static var cachedKoreanModelConfig: SFSpeechLanguageModel.Configuration?
+
+    /// Version tag — bump this when the phrase list changes to invalidate the cache.
+    private static let koreanModelVersion = "1.0"
+
     /// Prepares a custom Korean language model with common phrases to boost recognition accuracy.
+    /// Returns a cached configuration if the compiled model already exists on disk.
     private static func prepareKoreanLanguageModel() async throws -> SFSpeechLanguageModel.Configuration {
+        // Fast path: return in-memory cached config
+        if let cached = cachedKoreanModelConfig {
+            logger.info("Using cached Korean language model (in-memory)")
+            return cached
+        }
+
         let modelDir = customModelDirectory
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
         let trainingDataURL = modelDir.appendingPathComponent("ko_training_data.bin")
         let compiledModelURL = modelDir.appendingPathComponent("ko_language_model")
         let compiledVocabURL = modelDir.appendingPathComponent("ko_vocabulary")
+        let versionFile = modelDir.appendingPathComponent("ko_model_version.txt")
+
+        let config = SFSpeechLanguageModel.Configuration(
+            languageModel: compiledModelURL,
+            vocabulary: compiledVocabURL
+        )
+
+        // Check if compiled model already exists on disk with matching version
+        let fm = FileManager.default
+        let currentVersion = (try? String(contentsOf: versionFile, encoding: .utf8)) ?? ""
+        if currentVersion == koreanModelVersion
+            && fm.fileExists(atPath: compiledModelURL.path)
+            && fm.fileExists(atPath: compiledVocabURL.path) {
+            logger.info("Using cached Korean language model (on-disk)")
+            cachedKoreanModelConfig = config
+            return config
+        }
 
         // Build training data with common Korean conversational phrases
         let customData = SFCustomLanguageModelData(
             locale: Locale(identifier: "ko-KR"),
             identifier: "com.livetranscribe.korean",
-            version: "1.0"
+            version: koreanModelVersion
         ) {
             // Common conversational phrases
             SFCustomLanguageModelData.PhraseCount(phrase: "안녕하세요", count: 100)
@@ -77,11 +107,6 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
         try await customData.export(to: trainingDataURL)
         logger.info("Exported Korean custom language model training data")
 
-        let config = SFSpeechLanguageModel.Configuration(
-            languageModel: compiledModelURL,
-            vocabulary: compiledVocabURL
-        )
-
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             SFSpeechLanguageModel.prepareCustomLanguageModel(
                 for: trainingDataURL,
@@ -95,7 +120,11 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
             }
         }
 
+        // Write version marker so we can skip recompilation next launch
+        try? koreanModelVersion.write(to: versionFile, atomically: true, encoding: .utf8)
+
         logger.info("Korean custom language model compiled successfully")
+        cachedKoreanModelConfig = config
         return config
     }
 
@@ -104,7 +133,9 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
     /// Starts speech recognition via SpeechAnalyzer with DictationTranscriber and returns an AsyncStream of results.
     /// The analyzer automatically restarts periodically to maintain recognition quality.
     func start(locale: Locale) throws -> AsyncStream<Result> {
-        let (resultStream, resultContinuation) = AsyncStream<Result>.makeStream()
+        let (resultStream, resultContinuation) = AsyncStream<Result>.makeStream(
+            bufferingPolicy: .bufferingNewest(20)
+        )
         let capturedLocale = locale
 
         // Start a detached task to handle the async setup and result consumption
@@ -121,6 +152,10 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
                         logger.info("Custom Korean language model ready")
                     } catch {
                         logger.warning("Failed to prepare Korean language model, continuing without it: \(error.localizedDescription)")
+                        // Surface the error so the user knows recognition may be degraded
+                        resultContinuation.yield(
+                            Result(text: "", isFinal: false, error: "Korean language model unavailable — recognition may be less accurate")
+                        )
                     }
                 }
 
@@ -191,8 +226,16 @@ final class SpeechAnalyzerSession: @unchecked Sendable {
             supporting: [transcriber]
         ) {
             logger.info("Downloading speech model for \(locale.identifier)...")
-            try await downloader.downloadAndInstall()
-            logger.info("Speech model download complete for \(locale.identifier)")
+            do {
+                try await downloader.downloadAndInstall()
+                logger.info("Speech model download complete for \(locale.identifier)")
+            } catch {
+                logger.error("Speech model download failed for \(locale.identifier): \(error.localizedDescription)")
+                resultContinuation.yield(
+                    Result(text: "", isFinal: false, error: "Speech model download failed: \(error.localizedDescription)")
+                )
+                throw error
+            }
         }
 
         // Create input stream for this analyzer cycle

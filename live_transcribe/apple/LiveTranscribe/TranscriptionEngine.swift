@@ -209,6 +209,10 @@ final class TranscriptionEngine {
     }
 
     func stop() async {
+        // Set isListening = false first so in-flight callbacks see the flag
+        // before their tasks are cancelled, avoiding state access after teardown.
+        isListening = false
+
         analyzerSession?.stop()
         recognizerSession?.stop()
         resultTask?.cancel()
@@ -224,7 +228,6 @@ final class TranscriptionEngine {
         silenceTask = nil
         lastFinalizedCumulative = ""
         lastRawCumulative = ""
-        isListening = false
         volatileText = ""
         volatileTranslation = ""
         audioRMS = 0
@@ -241,7 +244,9 @@ final class TranscriptionEngine {
     ) {
         translationContinuation?.finish()
 
-        let (stream, continuation) = AsyncStream<TranslationRequest>.makeStream()
+        let (stream, continuation) = AsyncStream<TranslationRequest>.makeStream(
+            bufferingPolicy: .bufferingNewest(10)
+        )
         translationContinuation = continuation
 
         let pending: [(id: UUID, text: String)] = entries
@@ -262,7 +267,9 @@ final class TranscriptionEngine {
     func makeVolatileTranslationStream() -> AsyncStream<String> {
         volatileTranslationContinuation?.finish()
 
-        let (stream, continuation) = AsyncStream<String>.makeStream()
+        let (stream, continuation) = AsyncStream<String>.makeStream(
+            bufferingPolicy: .bufferingNewest(5)
+        )
         volatileTranslationContinuation = continuation
         return stream
     }

@@ -37,29 +37,45 @@ struct ContentView: View {
                 let volatileTask = Task {
                     for await text in volatileStream {
                         guard !Task.isCancelled else { break }
-                        let response = try? await session.translate(text)
-                        // Only apply if volatile text hasn't changed
-                        if engine.volatileText == text {
-                            engine.completeVolatileTranslation(response?.targetText)
+                        do {
+                            let response = try await session.translate(text)
+                            if engine.volatileText == text {
+                                engine.completeVolatileTranslation(response.targetText)
+                            }
+                        } catch {
+                            // Volatile translation failures are non-critical — just clear it
+                            if engine.volatileText == text {
+                                engine.completeVolatileTranslation(nil)
+                            }
                         }
                     }
                 }
 
                 // Batch-translate already-pending entries
                 for item in pending {
-                    let response = try? await session.translate(item.text)
-                    engine.completeTranslation(
-                        id: item.id, result: response?.targetText
-                    )
+                    do {
+                        let response = try await session.translate(item.text)
+                        engine.completeTranslation(
+                            id: item.id, result: response.targetText
+                        )
+                    } catch {
+                        engine.completeTranslation(id: item.id, result: nil)
+                        engine.errorMessage = "Translation failed: \(error.localizedDescription)"
+                    }
                 }
 
                 // Translate new entries as they arrive
                 for await request in stream {
                     guard !Task.isCancelled else { break }
-                    let response = try? await session.translate(request.text)
-                    engine.completeTranslation(
-                        id: request.id, result: response?.targetText
-                    )
+                    do {
+                        let response = try await session.translate(request.text)
+                        engine.completeTranslation(
+                            id: request.id, result: response.targetText
+                        )
+                    } catch {
+                        engine.completeTranslation(id: request.id, result: nil)
+                        engine.errorMessage = "Translation failed: \(error.localizedDescription)"
+                    }
                 }
 
                 volatileTask.cancel()
