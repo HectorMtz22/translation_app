@@ -811,7 +811,7 @@ def main():
     parser = argparse.ArgumentParser(description="Live system audio transcription with speaker diarization")
     parser.add_argument("-d", "--device", type=int, default=None,
                         help="Input device index (skip interactive prompt)")
-    parser.add_argument("-m", "--model", choices=["medium", "turbo", "full"], default="medium",
+    parser.add_argument("-m", "--model", choices=["medium", "turbo", "full"], default="full",
                         help="Whisper model: medium (fast, real-time), turbo (4 decoder layers), or full (large-v3, 32 layers)")
     parser.add_argument("-t", "--translator", choices=["google", "deepl", "qwen", "nllb", "none"], default=None,
                         help="Translation service: google, deepl, or none to disable")
