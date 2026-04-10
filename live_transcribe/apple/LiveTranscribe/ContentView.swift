@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var engine = TranscriptionEngine()
+    @State private var shouldAutoScroll = true
 
     var body: some View {
         NavigationStack {
@@ -295,18 +296,27 @@ struct ContentView: View {
                     }
                     .id("volatile")
                 }
+
+                Color.clear
+                    .frame(height: 1)
+                    .id("bottom")
+                    .onScrollVisibilityChange(threshold: 0.0) { visible in
+                        shouldAutoScroll = visible
+                    }
             }
             .listStyle(.plain)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onChange(of: engine.entries.count) {
-                withAnimation {
-                    if let last = engine.entries.last {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                if shouldAutoScroll {
+                    withAnimation {
+                        proxy.scrollTo("bottom", anchor: .bottom)
                     }
                 }
             }
             .onChange(of: engine.volatileText) {
-                proxy.scrollTo("volatile", anchor: .bottom)
+                if shouldAutoScroll {
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
             }
             .overlay {
                 if engine.entries.isEmpty && !engine.isListening {
